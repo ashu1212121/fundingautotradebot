@@ -82,7 +82,6 @@ def check_balance_sync():
         return 0
 
 async def check_balance_async():
-    # You can use this in async handlers if needed
     from binance import AsyncClient
     try:
         async_binance = await AsyncClient.create(BINANCE_API_KEY, BINANCE_API_SECRET)
@@ -295,8 +294,10 @@ def make_trade(coin):
 async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
     try:
         msg = update.message.text
+        print(f"[DEBUG] Received in alert room: {msg!r}")  # Debug log for every received message
 
-        if "❕ No lead found" in msg:
+        # Flexible matching for "no lead found"
+        if msg and "no lead found" in msg.lower():
             await say(LOG_ROOM_ID,
                 f"🔄 NO TRADE NOW\n"
                 f"▫️ Time: {datetime.utcnow().strftime('%H:%M:%S UTC')}\n"
