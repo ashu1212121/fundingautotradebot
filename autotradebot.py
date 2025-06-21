@@ -4,9 +4,10 @@ import threading
 import os
 import requests
 from datetime import datetime, timedelta
-from binance.client import Client
+from binance.client import Client, BinanceAPIException
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
+# ENVIRONMENT VARIABLES
 try:
     TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
     ALERT_ROOM_ID = int(os.environ["ALERT_ROOM_ID"])
@@ -14,7 +15,7 @@ try:
     BINANCE_API_KEY = os.environ["BINANCE_API_KEY"]
     BINANCE_API_SECRET = os.environ["BINANCE_API_SECRET"]
 except KeyError as e:
-    print(f"❗ Environment variable missing: {e}")
+    print(f"❗ ENV ERROR: Missing environment variable: {e}")
     exit(1)
 
 binance = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
@@ -52,15 +53,20 @@ async def flush_message_buffer():
 # --- Error Handling Helper ---
 
 def handle_exception(where, e):
-    msg = f"❌ ERROR in {where}: {e}"
+    msg = f"❌ ERROR in {where}: {type(e).__name__}: {e}"
     print(msg)
     say_sync(LOG_ROOM_ID, msg)
+
+def log_step(step):
+    now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+    print(f"[STEP {now}] {step}")
+    say_sync(LOG_ROOM_ID, f"[STEP {now}] {step}")
 
 # --- Balance Check ---
 
 def check_balance_sync():
+    log_step("Starting check_balance_sync")
     try:
-        # Get USDT balance from Binance futures wallet
         balance_list = binance.futures_account_balance()
         usdt_bal = None
         for asset in balance_list:
@@ -77,12 +83,18 @@ def check_balance_sync():
             )
             say_sync(LOG_ROOM_ID, msg)
         return usdt_bal
+    except BinanceAPIException as e:
+        handle_exception("check_balance_sync", e)
+        if e.code == -2015:
+            say_sync(LOG_ROOM_ID, "❗ Check your Binance API key, secret, IP whitelist, and permissions.")
+        return 0
     except Exception as e:
         handle_exception("check_balance_sync", e)
         return 0
 
 async def check_balance_async():
     from binance import AsyncClient
+    log_step("Starting check_balance_async")
     try:
         async_binance = await AsyncClient.create(BINANCE_API_KEY, BINANCE_API_SECRET)
         balance_list = await async_binance.futures_account_balance()
@@ -102,6 +114,11 @@ async def check_balance_async():
             )
             await say(LOG_ROOM_ID, msg)
         return usdt_bal
+    except BinanceAPIException as e:
+        handle_exception("check_balance_async", e)
+        if e.code == -2015:
+            await say(LOG_ROOM_ID, "❗ Check your Binance API key, secret, IP whitelist, and permissions.")
+        return 0
     except Exception as e:
         handle_exception("check_balance_async", e)
         return 0
@@ -109,6 +126,7 @@ async def check_balance_async():
 # --- Show Railway IP Address ---
 
 async def show_ip_startup():
+    log_step("Fetching Railway Public IP")
     try:
         ip = requests.get("https://api.ipify.org").text.strip()
         await say(LOG_ROOM_ID, f"🚦 Railway Public IP: `{ip}`\nWhitelist this IP for Binance API access.")
@@ -120,11 +138,14 @@ async def show_ip_startup():
 
 async def on_startup(application):
     try:
+        log_step("on_startup started")
         calibrate_time_sync(binance)
+        log_step("Flushing message buffer")
         await flush_message_buffer()
         await show_ip_startup()
         await say(LOG_ROOM_ID, "🤖 HELLO! I'M YOUR MONEY ROBOT (NOW FASTER, MORE PRECISE, AND SAFER)!")
         check_balance_sync()
+        log_step("on_startup finished")
     except Exception as e:
         handle_exception("on_startup", e)
 
@@ -134,8 +155,9 @@ time_offset = 0.0
 
 def calibrate_time_sync(binance):
     global time_offset
+    log_step("Starting time sync calibration")
     measurements = []
-    for _ in range(10):
+    for i in range(10):
         try:
             t0 = time.time() * 1000
             server_time = int(binance.futures_time()['serverTime'])
@@ -144,17 +166,20 @@ def calibrate_time_sync(binance):
             measurements.append(offset)
             time.sleep(0.05)
         except Exception as e:
-            handle_exception("calibrate_time_sync", e)
+            handle_exception(f"calibrate_time_sync (iteration {i})", e)
     if measurements:
         time_offset = sum(measurements) / len(measurements)
+    log_step(f"Time offset set to {time_offset} ms")
 
 def get_server_time():
     return time.time() * 1000 + time_offset
 
 def precision_wait(target_ts_ms):
+    log_step(f"Entering precision_wait for target {target_ts_ms}")
     while True:
         current = get_server_time()
         if current >= target_ts_ms:
+            log_step("precision_wait finished")
             return
         remaining = target_ts_ms - current
         time.sleep(max(remaining / 2000, 0.001))
@@ -185,15 +210,19 @@ def read_alert(alert_text):
     return None
 
 def count_coins(coin, leverage):
+    log_step(f"Counting coins for {coin} at leverage {leverage}")
     try:
         price = float(binance.futures_symbol_ticker(symbol=coin)['price'])
         max_coins = (10 * leverage) / price
-        return int(max_coins * 0.75)
+        qty = int(max_coins * 0.75)
+        log_step(f"Calculated qty={qty} for {coin}")
+        return qty
     except Exception as e:
         handle_exception("count_coins", e)
         return 0
 
 def is_still_good(coin):
+    log_step(f"Checking is_still_good for {coin}")
     try:
         fr_data = binance.futures_premium_index(symbol=coin)
         current_fr = float(fr_data['lastFundingRate'])
@@ -201,6 +230,7 @@ def is_still_good(coin):
         lev_data = binance.futures_leverage_bracket(symbol=coin)
         leverage = lev_data[0]['brackets'][0]['initialLeverage']
         value = abs_fr * leverage
+        log_step(f"is_still_good={value > 100} (value={value}, current_fr={current_fr})")
         return value > 100, value, current_fr
     except Exception as e:
         handle_exception("is_still_good", e)
@@ -208,6 +238,7 @@ def is_still_good(coin):
 
 def make_trade(coin):
     try:
+        log_step(f"make_trade started for {coin}")
         check_balance_sync()  # check balance before trade
         data = trade_notes[coin]
 
@@ -288,13 +319,15 @@ def make_trade(coin):
             f"▫️ Time: {datetime.utcnow().strftime('%H:%M:%S')} UTC")
         del trade_notes[coin]
         check_balance_sync()  # check after trade
+        log_step(f"make_trade finished for {coin}")
     except Exception as e:
         handle_exception("make_trade", e)
 
 async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
     try:
         msg = update.message.text
-        print(f"[DEBUG] Received in alert room: {msg!r}")  # Debug log for every received message
+        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+        print(f"[DEBUG {now}] Received in alert room: {msg!r}")  # Debug log for every received message
 
         # Flexible matching for "no lead found"
         if msg and "no lead found" in msg.lower():
@@ -302,6 +335,7 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
                 f"🔄 NO TRADE NOW\n"
                 f"▫️ Time: {datetime.utcnow().strftime('%H:%M:%S UTC')}\n"
                 f"▫️ Robot is awake!")
+            log_step("NO TRADE NOW message sent")
             return
 
         if "🚨 ALERT:" in msg or "🚨 <b>ALERT:" in msg:
@@ -312,6 +346,7 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
                 qty = count_coins(coin, alert_data["leverage"])
                 if qty == 0:
                     await say(LOG_ROOM_ID, f"❌ TRADE FAILED: Could not count coins for {coin}.")
+                    log_step(f"Could not count coins for {coin}, trade aborted")
                     return
 
                 trade_notes[coin] = {
@@ -324,7 +359,7 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
                     f"🔔 NEW: {coin}\n"
                     f"▫️ Qty: {qty}\n"
                     f"▫️ Check at {(alert_data['time']-timedelta(minutes=5)).strftime('%H:%M:%S')} UTC")
-
+                log_step(f"Trade note set for {coin}, timer for make_trade started")
                 wait_time = (alert_data['time'] - timedelta(minutes=5) - datetime.utcnow()).total_seconds()
                 threading.Timer(wait_time, make_trade, [coin]).start()
     except Exception as e:
@@ -333,11 +368,11 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     global application
     try:
-        print("Building application...")
+        log_step("Building application")
         application = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(on_startup).build()
-        print("Adding handler...")
+        log_step("Adding handler")
         application.add_handler(MessageHandler(filters.Chat(ALERT_ROOM_ID) & filters.TEXT, handle_message))
-        print("Starting polling...")
+        log_step("Starting polling")
         application.run_polling()
     except Exception as e:
         print(f"Fatal error on startup: {e}")
