@@ -58,7 +58,6 @@ def preflight_binance_check():
 preflight_binance_check()
 
 binance = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
-trade_notes = {}
 
 def heartbeat():
     print(f"[HEARTBEAT] Trade Bot is alive at {datetime.now(timezone.utc).isoformat()}")
@@ -140,10 +139,14 @@ def read_alert(alert_text):
 async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
     try:
         msg = update.message.text or ""
-        # 1. Log every alert room message for transparency
-        await say(LOG_ROOM_ID, f"📥 Alert room message received:\n{msg}")
 
-        # 2. Detect "no lead found" robustly
+        # --- MIRROR EVERY MESSAGE TO LOG ROOM INSTANTLY ---
+        await say(LOG_ROOM_ID, f"🛑 MIRROR FROM ALERT ROOM:\n{msg}")
+
+        # --- Optionally, also print to stdout for debugging ---
+        print(f"[ALERT MSG MIRRORED] {msg}")
+
+        # --- "No lead found" detection (robust) ---
         plain_msg = re.sub(r'<.*?>', '', msg).strip().lower()
         if (
             "no lead found" in plain_msg or
@@ -157,7 +160,7 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # 3. Robust trade alert detection and parsing
+        # --- Trade alert detection and parsing ---
         if "alert:" in plain_msg:
             alert_data = read_alert(msg)
             if not alert_data:
