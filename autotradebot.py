@@ -3,16 +3,17 @@ import time
 import threading
 import os
 import requests
+import asyncio
 from datetime import datetime, timedelta
 from binance.client import Client
 from telegram import Bot
-from telegram.ext import Updater, MessageHandler, Filters
+from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
 # ===== GET SECRETS FROM ENVIRONMENT VARIABLES =====
 try:
     TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-    ALERT_ROOM_ID = os.environ["ALERT_ROOM_ID"]
-    LOG_ROOM_ID = os.environ["LOG_ROOM_ID"]
+    ALERT_ROOM_ID = int(os.environ["ALERT_ROOM_ID"])
+    LOG_ROOM_ID = int(os.environ["LOG_ROOM_ID"])
     BINANCE_API_KEY = os.environ["BINANCE_API_KEY"]
     BINANCE_API_SECRET = os.environ["BINANCE_API_SECRET"]
 except KeyError as e:
@@ -191,7 +192,7 @@ def make_trade(coin):
         f"▫️ Time: {datetime.utcnow().strftime('%H:%M:%S')} UTC")
     del trade_notes[coin]
 
-def handle_message(update, context):
+async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message.text
 
     if "❕ No lead found" in msg:
@@ -225,12 +226,14 @@ def handle_message(update, context):
             wait_time = (alert_data['time'] - timedelta(minutes=5) - datetime.utcnow()).total_seconds()
             threading.Timer(wait_time, make_trade, [coin]).start()
 
-calibrate_time_sync(binance)
-show_ip()
-say(LOG_ROOM_ID, "🤖 HELLO! I'M YOUR MONEY ROBOT (NOW FASTER, MORE PRECISE, AND SAFER)!")
+def main():
+    calibrate_time_sync(binance)
+    show_ip()
+    say(LOG_ROOM_ID, "🤖 HELLO! I'M YOUR MONEY ROBOT (NOW FASTER, MORE PRECISE, AND SAFER)!")
 
-updater = Updater(TELEGRAM_TOKEN)
-dp = updater.dispatcher
-dp.add_handler(MessageHandler(Filters.chat(int(ALERT_ROOM_ID)) & Filters.text, handle_message))
-updater.start_polling()
-updater.idle()
+    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    application.add_handler(MessageHandler(filters.Chat(ALERT_ROOM_ID) & filters.TEXT, handle_message))
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()
