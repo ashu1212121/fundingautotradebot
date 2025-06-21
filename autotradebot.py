@@ -22,7 +22,8 @@ except KeyError as e:
     sys.exit(1)
 
 try:
-    from binance.client import Client, BinanceAPIException
+    from binance.client import Client
+    from binance.exceptions import BinanceAPIException
     from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 except Exception as e:
     print("❗ PYTHON IMPORT ERROR:", e)
@@ -62,13 +63,11 @@ preflight_binance_check()
 binance = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 trade_notes = {}
 
-# --- Only print minimal heartbeat to console for debugging ---
 def heartbeat():
     print(f"[HEARTBEAT] Bot is alive at {datetime.now(timezone.utc).isoformat()}")
     threading.Timer(60, heartbeat).start()
 heartbeat()
 
-# --- Minimal async say, no buffer, only for Telegram group notifications ---
 async def say(room, message):
     try:
         await application.bot.send_message(chat_id=room, text=message)
@@ -82,7 +81,6 @@ async def notify_error(where, error):
     except Exception as e:
         print(f"[Telegram ERROR] Failed to send error message: {e}")
 
-# --- On startup: only send "Bot started!" ---
 async def on_startup(application):
     await say(LOG_ROOM_ID, "🤖 Bot started and ready!")
     try:
@@ -90,19 +88,6 @@ async def on_startup(application):
         print(f"[INFO] Public IP: {ip}")
     except Exception:
         pass
-
-def check_balance_sync():
-    try:
-        balance_list = binance.futures_account_balance()
-        usdt_bal = None
-        for asset in balance_list:
-            if asset["asset"] == "USDT":
-                usdt_bal = float(asset["balance"])
-                break
-        return usdt_bal if usdt_bal is not None else 0
-    except Exception as e:
-        print(f"[Balance ERROR] {e}")
-        return 0
 
 def count_coins(coin, leverage):
     try:
@@ -126,14 +111,6 @@ def is_still_good(coin):
     except Exception as e:
         print(f"[Check funding ERROR] {e}")
         return False, 0, 0
-
-def precision_wait(target_ts_ms):
-    while True:
-        current = time.time() * 1000
-        if current >= target_ts_ms:
-            return
-        remaining = target_ts_ms - current
-        time.sleep(max(remaining / 2000, 0.001))
 
 def read_alert(alert_text):
     pattern = (
@@ -160,129 +137,138 @@ def read_alert(alert_text):
         }
     return None
 
-async def make_trade_async(coin):
+async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        data = trade_notes[coin]
-        check_time = data['time'] - timedelta(minutes=5)
-        check_time_ts = check_time.replace(tzinfo=timezone.utc).timestamp() * 1000
-        precision_wait(check_time_ts)
+        msg = update.message.text
 
-        good, value, current_fr = is_still_good(coin)
-        if not good:
-            del trade_notes[coin]
-            return
-
-        direction = "SELL" if current_fr > 0 else "BUY"
-
-        try:
-            binance.futures_change_leverage(symbol=coin, leverage=data['leverage'])
-        except Exception as e:
-            await notify_error("make_trade (set leverage)", e)
-            del trade_notes[coin]
-            return
-
-        entry_time = data['time'] - timedelta(seconds=1)
-        entry_time_ts = entry_time.replace(tzinfo=timezone.utc).timestamp() * 1000
-        precision_wait(entry_time_ts)
-
-        try:
-            binance.futures_create_order(
-                symbol=coin,
-                side=direction,
-                type="MARKET",
-                quantity=data['qty']
+        # Defensive: Remove HTML tags and lowercase for robust detection
+        plain_msg = re.sub(r'<.*?>', '', msg or '').strip().lower()
+        if "no lead found" in plain_msg:
+            await say(LOG_ROOM_ID,
+                f"🔄 No trade planned.\n"
+                f"Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}\n"
+                f"(Alert room message: {msg})"
             )
-        except Exception as e:
-            await notify_error("make_trade (open position)", e)
-            del trade_notes[coin]
             return
 
-        real_entry = datetime.now(timezone.utc)
+        if "🚨 alert:" in plain_msg:
+            alert_data = read_alert(msg)
+            if alert_data:
+                coin = alert_data["coin"]
+                leverage = alert_data["leverage"]
+                funding_time = alert_data["time"]
+                now = datetime.now(timezone.utc)
 
-        got_money = False
+                qty = count_coins(coin, leverage)
+                if qty == 0:
+                    await say(LOG_ROOM_ID, f"❌ Trade failed: Could not count coins for {coin}.")
+                    return
+
+                # Set leverage now
+                try:
+                    binance.futures_change_leverage(symbol=coin, leverage=leverage)
+                    fr_data = binance.futures_premium_index(symbol=coin)
+                    current_fr = float(fr_data['lastFundingRate'])
+                    direction = "SELL" if current_fr > 0 else "BUY"
+                except Exception as e:
+                    await notify_error("handle_message (pre-checks)", e)
+                    return
+
+                # Calculate entry and 5-min check times
+                entry_time = funding_time - timedelta(seconds=1)
+                check_time = entry_time - timedelta(minutes=5)
+                minutes_remaining = (entry_time - now).total_seconds() / 60
+                if minutes_remaining > 1:
+                    time_str = f"{minutes_remaining:.1f} minutes"
+                elif minutes_remaining > 0:
+                    time_str = f"{minutes_remaining*60:.0f} seconds"
+                else:
+                    time_str = "less than 1 second"
+
+                await say(
+                    LOG_ROOM_ID,
+                    f"🔔 New trade planned: {coin}\n"
+                    f"Direction: {direction}\n"
+                    f"Qty: {qty}\n"
+                    f"Entry at {entry_time.strftime('%H:%M:%S')} UTC (1s before funding)\n"
+                    f"⏳ Time remaining for entry: {time_str}\n"
+                    f"🕔 Funding rate/threshold check will occur 5 minutes before entry."
+                )
+
+                # Schedule the 5-minutes-before check and actual entry
+                def five_min_check_and_entry():
+                    good, value, current_fr2 = is_still_good(coin)
+                    if not good:
+                        asyncio.run(say(LOG_ROOM_ID, f"❌ Trade cancelled: Funding not good enough for {coin} (checked 5 min before entry)."))
+                        return
+                    seconds_until_entry = (entry_time - datetime.now(timezone.utc)).total_seconds()
+                    if seconds_until_entry > 0:
+                        threading.Timer(seconds_until_entry, lambda: asyncio.run(execute_trade(coin, qty, direction, funding_time))).start()
+                    else:
+                        asyncio.run(execute_trade(coin, qty, direction, funding_time))
+
+                seconds_until_5min = (check_time - now).total_seconds()
+                if seconds_until_5min > 0:
+                    threading.Timer(seconds_until_5min, five_min_check_and_entry).start()
+                else:
+                    threading.Thread(target=five_min_check_and_entry).start()
+    except Exception as e:
+        await notify_error("handle_message", e)
+
+async def execute_trade(coin, qty, direction, funding_time):
+    try:
+        # Place entry order 1 second before funding
+        entry_order = binance.futures_create_order(
+            symbol=coin,
+            side=direction,
+            type="MARKET",
+            quantity=qty
+        )
+        entry_time = datetime.now(timezone.utc)
+        await say(LOG_ROOM_ID, f"🚀 {coin} {direction} order placed at {entry_time.strftime('%H:%M:%S')} UTC")
+
+        # Poll for funding fee every 100ms, for up to 30s after funding_time
+        found_fee = False
         money_bag = 0.0
-        wait_start = time.time()
-        while not got_money and (time.time() - wait_start < 10):
+        poll_start = time.time()
+        funding_ts_ms = int(funding_time.timestamp() * 1000)
+
+        while time.time() - poll_start < 30:
             try:
-                money_history = binance.futures_income_history(
+                history = binance.futures_income_history(
                     symbol=coin,
                     incomeType="FUNDING_FEE",
                     limit=1
                 )
-                if money_history and money_history[0]['time'] > int(real_entry.timestamp() * 1000):
-                    got_money = True
-                    money_bag = float(money_history[0]['income'])
+                if history and int(history[0]['time']) >= funding_ts_ms:
+                    found_fee = True
+                    money_bag = float(history[0]['income'])
                     break
             except Exception:
-                break
-            time.sleep(0.1)
+                pass
+            time.sleep(0.1)  # 100ms
 
+        # Exit as soon as funding fee is seen (or after timeout)
         close_side = "BUY" if direction == "SELL" else "SELL"
         try:
             binance.futures_create_order(
                 symbol=coin,
                 side=close_side,
                 type="MARKET",
-                quantity=data['qty'],
+                quantity=qty,
                 reduceOnly=True
             )
+            await say(LOG_ROOM_ID, f"✅ {coin} position closed (post-funding, fee detected: {found_fee})")
         except Exception as e:
-            await notify_error("make_trade (close position)", e)
-            del trade_notes[coin]
-            return
+            await notify_error("execute_trade (close position)", e)
 
-        await say(LOG_ROOM_ID,
-            f"💰 TRADE DONE: {coin}\n"
-            f"Money: {'✅' if got_money else '❌'} {money_bag:.6f} USDT\n"
-            f"Time: {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
-        )
+        if found_fee:
+            await say(LOG_ROOM_ID, f"💰 Funding fee received: {money_bag:.6f} USDT")
+        else:
+            await say(LOG_ROOM_ID, f"⚠️ Funding fee not detected within 30s.")
 
-        del trade_notes[coin]
     except Exception as e:
-        await notify_error("make_trade", e)
-
-def schedule_trade(coin):
-    asyncio.run(make_trade_async(coin))
-
-async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        msg = update.message.text
-
-        if msg and "no lead found" in msg.lower():
-            await say(LOG_ROOM_ID,
-                f"🔄 No trade planned.\n"
-                f"Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
-            )
-            return
-
-        if "🚨 ALERT:" in msg or "🚨 <b>ALERT:" in msg:
-            alert_data = read_alert(msg)
-            if alert_data:
-                coin = alert_data["coin"]
-                qty = count_coins(coin, alert_data["leverage"])
-                if qty == 0:
-                    await say(LOG_ROOM_ID, f"❌ Trade failed: Could not count coins for {coin}.")
-                    return
-
-                trade_notes[coin] = {
-                    'qty': qty,
-                    'leverage': alert_data["leverage"],
-                    'time': alert_data["time"]
-                }
-
-                await say(LOG_ROOM_ID,
-                    f"🔔 New trade: {coin}\n"
-                    f"Qty: {qty}\n"
-                    f"Check at {(alert_data['time']-timedelta(minutes=5)).strftime('%H:%M:%S')} UTC"
-                )
-                wait_time = (alert_data['time'] - timedelta(minutes=5) - datetime.now(timezone.utc)).total_seconds()
-                if wait_time > 0:
-                    threading.Timer(wait_time, schedule_trade, [coin]).start()
-                else:
-                    # If alert time is already within 5min, execute immediately
-                    threading.Thread(target=schedule_trade, args=(coin,)).start()
-    except Exception as e:
-        await notify_error("handle_message", e)
+        await notify_error("execute_trade", e)
 
 def main():
     global application
