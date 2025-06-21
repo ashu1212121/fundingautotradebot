@@ -56,7 +56,6 @@ def preflight_binance_check():
         sys.exit(1)
 
 preflight_binance_check()
-
 binance = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 
 def heartbeat():
@@ -109,7 +108,6 @@ def is_still_good(coin):
         return False, 0, 0
 
 def read_alert(alert_text):
-    # Accepts both HTML and plain text, tolerates extra whitespace
     pattern = (
         r"ALERT:\s*(\w+)[^A-Za-z0-9]+"
         r"Funding Rate:\s*([-+]?\d*\.?\d+)%[^A-Za-z0-9]+"
@@ -139,20 +137,26 @@ def read_alert(alert_text):
 async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
     try:
         msg = update.message.text or ""
-
-        # --- MIRROR EVERY MESSAGE TO LOG ROOM INSTANTLY ---
         await say(LOG_ROOM_ID, f"🛑 MIRROR FROM ALERT ROOM:\n{msg}")
-
-        # --- Optionally, also print to stdout for debugging ---
         print(f"[ALERT MSG MIRRORED] {msg}")
 
-        # --- "No lead found" detection (robust) ---
-        plain_msg = re.sub(r'<.*?>', '', msg).strip().lower()
-        if (
-            "no lead found" in plain_msg or
-            "❕ no lead found" in plain_msg or
-            "no trade found" in plain_msg
-        ):
+        # --- Robust no-trade planned detection ---
+        cleaned = re.sub(r'<.*?>', '', msg)
+        cleaned = re.sub(r'[^\w\s]', '', cleaned)
+        cleaned = cleaned.strip().lower()
+        print(f"[DEBUG] Cleaned message: '{cleaned}'")
+
+        no_lead_patterns = [
+            "no lead found",
+            "no trade found",
+            "no alert found",
+            "no opportunity found",
+            "no lead identified",
+            "no trades today",
+            "no alert this check",
+            "no lead this check"
+        ]
+        if any(pattern in cleaned for pattern in no_lead_patterns):
             await say(LOG_ROOM_ID,
                 f"🔄 No trade planned.\n"
                 f"Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}\n"
@@ -160,8 +164,7 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # --- Trade alert detection and parsing ---
-        if "alert:" in plain_msg:
+        if "alert:" in cleaned:
             alert_data = read_alert(msg)
             if not alert_data:
                 await say(LOG_ROOM_ID,
@@ -169,7 +172,7 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
                     f"Message received:\n{msg}\n"
                     f"Please check alert format or regex."
                 )
-                return  # Don't proceed if parsing fails
+                return
 
             coin = alert_data["coin"]
             leverage = alert_data["leverage"]
@@ -181,7 +184,6 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
                 await say(LOG_ROOM_ID, f"❌ Trade failed: Could not count coins for {coin}.")
                 return
 
-            # Set leverage now
             try:
                 binance.futures_change_leverage(symbol=coin, leverage=leverage)
                 fr_data = binance.futures_premium_index(symbol=coin)
@@ -191,7 +193,6 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
                 await notify_error("handle_message (pre-checks)", e)
                 return
 
-            # Calculate entry and 5-min check times
             entry_time = funding_time - timedelta(seconds=1)
             check_time = entry_time - timedelta(minutes=5)
             minutes_remaining = (entry_time - now).total_seconds() / 60
@@ -212,7 +213,6 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
                 f"🕔 Funding rate/threshold check will occur 5 minutes before entry."
             )
 
-            # Schedule the 5-minutes-before check and actual entry
             def five_min_check_and_entry():
                 good, value, current_fr2 = is_still_good(coin)
                 if not good:
