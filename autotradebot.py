@@ -96,7 +96,7 @@ async def say(room, message):
     """Asynchronous Telegram message sender"""
     global application
     try:
-        if application and application.bot:
+        if application and hasattr(application, "bot"):
             await application.bot.send_message(chat_id=room, text=message)
         else:
             logger.warning("Application not initialized, using sync send")
@@ -116,7 +116,10 @@ def heartbeat():
     try:
         now = datetime.now(timezone.utc)
         logger.info(f"[HEARTBEAT] Trade Bot is alive at {now.isoformat()}")
-        send_telegram_message_sync(LOG_ROOM_ID, f"❤️ HEARTBEAT: {now.strftime('%H:%M:%S UTC')}")
+        try:
+            asyncio.run(say(LOG_ROOM_ID, f"❤️ HEARTBEAT: {now.strftime('%H:%M:%S UTC')}"))
+        except:
+            send_telegram_message_sync(LOG_ROOM_ID, f"❤️ HEARTBEAT: {now.strftime('%H:%M:%S UTC')}")
     except Exception as e:
         logger.error(f"Heartbeat failed: {e}")
     finally:
@@ -358,17 +361,33 @@ async def execute_trade(coin, qty, direction, funding_time):
     except Exception as e:
         await notify_error("execute_trade", e)
 
+# --- Main Application ---
 def main():
     logger.info("Starting main application")
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     try:
-        app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-        app.add_handler(MessageHandler(filters.Chat(ALERT_ROOM_ID) & (filters.TEXT | filters.CAPTION), handle_message))
-        app.post_init(on_startup)
+        # Explicit event loop setup
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        app = (
+            ApplicationBuilder()
+            .token(TELEGRAM_TOKEN)
+            .post_init(on_startup)
+            .build()
+        )
+
+        app.add_handler(
+            MessageHandler(
+                filters.Chat(chat_id=ALERT_ROOM_ID) & filters.TEXT,
+                handle_message
+            )
+        )
+
+        logger.info(f"Handler registered for chat ID: {ALERT_ROOM_ID}")
         logger.info("Starting polling...")
-        app.run_polling()
+
+        loop.run_until_complete(app.run_polling())
+
     except Exception as e:
         logger.critical(f"Fatal error: {e}")
         traceback.print_exc()
