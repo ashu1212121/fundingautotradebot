@@ -10,7 +10,6 @@ import asyncio
 
 print("=== TRADE BOT CONTAINER STARTED ===")
 
-# --- ENVIRONMENT VARIABLES ---
 try:
     TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
     ALERT_ROOM_ID = int(os.environ["ALERT_ROOM_ID"])
@@ -29,6 +28,8 @@ except Exception as e:
     print("❗ PYTHON IMPORT ERROR:", e)
     traceback.print_exc()
     sys.exit(1)
+
+application = None  # will be set in main()
 
 def preflight_binance_check():
     print("[STEP] Checking Binance API connectivity...")
@@ -58,11 +59,6 @@ def preflight_binance_check():
 preflight_binance_check()
 binance = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 
-def heartbeat():
-    print(f"[HEARTBEAT] Trade Bot is alive at {datetime.now(timezone.utc).isoformat()}")
-    threading.Timer(60, heartbeat).start()
-heartbeat()
-
 async def say(room, message):
     try:
         await application.bot.send_message(chat_id=room, text=message)
@@ -71,18 +67,49 @@ async def say(room, message):
         traceback.print_exc()
 
 async def notify_error(where, error):
+    await say(LOG_ROOM_ID, f"❗ Error in {where}: {type(error).__name__}: {error}")
+
+def heartbeat():
+    now = datetime.now(timezone.utc)
+    print(f"[HEARTBEAT] Trade Bot alive at {now.isoformat()}")
+    print(f"[ENV] ALERT_ROOM_ID: {ALERT_ROOM_ID}")
+    print(f"[ENV] LOG_ROOM_ID: {LOG_ROOM_ID}")
     try:
-        await say(LOG_ROOM_ID, f"❗ Error in {where}: {type(error).__name__}: {error}")
+        asyncio.run(say(LOG_ROOM_ID, f"❤️ HEARTBEAT: {now.strftime('%H:%M:%S UTC')}"))
     except Exception as e:
-        print(f"[Telegram ERROR] Failed to send error message: {e}")
+        print(f"HEARTBEAT TELEGRAM ERROR: {e}")
+    threading.Timer(60, heartbeat).start()
+
+heartbeat()
 
 async def on_startup(application):
-    await say(LOG_ROOM_ID, "🤖 Trade Bot started and ready!")
+    await say(LOG_ROOM_ID, "🤖 Trade Bot STARTING...")
+    await say(ALERT_ROOM_ID, "🔔 Bot activated in alert room")
+    await say(LOG_ROOM_ID, "🔔 Bot activated in log room")
+    try:
+        bot_info = await application.bot.get_me()
+        await say(LOG_ROOM_ID, f"🤖 BOT INFO:\nID: {bot_info.id}\nName: {bot_info.first_name}\nUsername: @{bot_info.username}")
+    except Exception as e:
+        await say(LOG_ROOM_ID, f"❗ BOT INFO ERROR: {e}")
     try:
         ip = requests.get("https://api.ipify.org").text.strip()
-        print(f"[INFO] Public IP: {ip}")
+        await say(LOG_ROOM_ID, f"[INFO] Public IP: {ip}")
     except Exception:
         pass
+
+async def check_permissions():
+    try:
+        chat = await application.bot.get_chat(ALERT_ROOM_ID)
+        perms = await application.bot.get_chat_member(ALERT_ROOM_ID, application.bot.id)
+        await say(LOG_ROOM_ID,
+            f"🔑 PERMISSIONS FOR {chat.title or 'DM'}:\n"
+            f"Type: {chat.type}\n"
+            f"Bot Status: {perms.status}\n"
+            f"Can Send: {getattr(perms, 'can_send_messages', 'N/A')}\n"
+            f"Can Read: {getattr(perms, 'can_read_messages', 'N/A')}"
+        )
+    except Exception as e:
+        await say(LOG_ROOM_ID, f"❌ PERMISSION CHECK FAILED: {e}")
 
 def count_coins(coin, leverage):
     try:
@@ -136,47 +163,64 @@ def read_alert(alert_text):
 
 async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        msg = update.message.text or ""
-        await say(LOG_ROOM_ID, f"🛑 MIRROR FROM ALERT ROOM:\n{msg}")
-        print(f"[ALERT MSG MIRRORED] {msg}")
+        # Capture raw message exactly as received
+        raw_msg = update.message.text or ""
+        print(f"\n\n[RAW MESSAGE RECEIVED] {raw_msg}")
 
-        # --- FIX: Only remove HTML, then lowercase and trim ---
-        cleaned = re.sub(r'<.*?>', '', msg)
-        cleaned = cleaned.strip().lower()
+        # Always mirror the raw message first
+        await say(LOG_ROOM_ID, f"🛑 RAW MIRROR:\n{raw_msg}")
+
+        # Simplified cleaning - preserve ALL content
+        cleaned = raw_msg.lower().strip()
         print(f"[DEBUG] Cleaned message: '{cleaned}'")
 
-        no_lead_patterns = [
-            "no lead found",
-            "no trade found",
-            "no alert found",
-            "no opportunity found",
-            "no lead identified",
-            "no trades today",
-            "no alert this check",
-            "no lead this check",
-            "❕ no lead found"
+        # Debug: Log all environment variables
+        print(f"[ENV] ALERT_ROOM_ID: {ALERT_ROOM_ID}")
+        print(f"[ENV] LOG_ROOM_ID: {LOG_ROOM_ID}")
+
+        # Manual debug command
+        if "/debug" in cleaned:
+            await check_permissions()
+            await say(LOG_ROOM_ID, "🛠️ DEBUG COMMAND EXECUTED")
+            return
+
+        # 1. Verify message source
+        if update.message.chat.id != ALERT_ROOM_ID:
+            await say(LOG_ROOM_ID, 
+                f"⚠️ Received message from unknown chat: {update.message.chat.id}\n"
+                f"Expected: {ALERT_ROOM_ID}"
+            )
+            return
+
+        # 2. No-lead detection with multiple strategies
+        NO_LEAD_PHRASES = [
+            "no lead", "no trade", "no alert", "not found", 
+            "no opportunity", "nothing found", "no setup", "❕"
         ]
+        is_no_lead = any(phrase in cleaned for phrase in NO_LEAD_PHRASES)
 
-        matched = False
-        for pattern in no_lead_patterns:
-            if pattern in cleaned:
-                print(f"[DEBUG] Matched pattern: '{pattern}'")
-                await say(LOG_ROOM_ID,
-                    f"🔄 No trade planned.\n"
-                    f"Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}\n"
-                    f"(Alert room message: {msg})"
-                )
-                matched = True
-                return
-        if not matched:
-            print(f"[DEBUG] No 'no lead' pattern matched in: '{cleaned}'")
+        if is_no_lead:
+            print(f"[NO LEAD DETECTED] Phrase matched in: {cleaned}")
+            await say(LOG_ROOM_ID,
+                f"🔄 NO TRADE PLANNED\n"
+                f"⌚ {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}\n"
+                f"📝 Original: {raw_msg[:100]}..."
+            )
+            return
+        else:
+            print(f"[NO LEAD NOT DETECTED] No matching phrases in: {cleaned}")
+            await say(LOG_ROOM_ID, 
+                f"🔍 No 'no lead' pattern found in message:\n{cleaned[:100]}..."
+            )
 
+        # 3. Alert detection and parsing
         if "alert:" in cleaned:
-            alert_data = read_alert(msg)
+            print("[ALERT DETECTED] Attempting to parse...")
+            alert_data = read_alert(raw_msg)
             if not alert_data:
                 await say(LOG_ROOM_ID,
                     f"❗ ALERT PARSE FAILURE: Could not parse trade signal from alert room message.\n"
-                    f"Message received:\n{msg}\n"
+                    f"Message received:\n{raw_msg}\n"
                     f"Please check alert format or regex."
                 )
                 return
@@ -236,8 +280,12 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
                 threading.Timer(seconds_until_5min, five_min_check_and_entry).start()
             else:
                 threading.Thread(target=five_min_check_and_entry).start()
+        else:
+            await say(LOG_ROOM_ID, "❌ No 'alert:' keyword found in message")
     except Exception as e:
-        await notify_error("handle_message", e)
+        error_msg = f"🚨 HANDLE MESSAGE CRASH: {type(e).__name__}: {e}\n{traceback.format_exc()}"
+        print(error_msg)
+        await say(LOG_ROOM_ID, error_msg)
 
 async def execute_trade(coin, qty, direction, funding_time):
     try:
@@ -295,7 +343,12 @@ def main():
     global application
     try:
         application = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(on_startup).build()
-        application.add_handler(MessageHandler(filters.Chat(ALERT_ROOM_ID) & filters.TEXT, handle_message))
+        handler = MessageHandler(
+            filters.Chat(chat_id=ALERT_ROOM_ID) & (filters.TEXT | filters.CAPTION),
+            handle_message
+        )
+        application.add_handler(handler)
+        print(f"[INIT] Handler registered for chat ID: {ALERT_ROOM_ID}")
         application.run_polling()
     except Exception as e:
         print(f"Fatal error on startup: {e}")
