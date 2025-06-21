@@ -4,7 +4,7 @@ import threading
 import os
 import requests
 from datetime import datetime, timedelta
-from binance.um_futures import UMFutures
+from binance.client import Client
 from telegram import Bot
 from telegram.ext import Updater, MessageHandler, Filters
 
@@ -21,7 +21,7 @@ except KeyError as e:
 # ==================================================
 
 money_bot = Bot(token=TELEGRAM_TOKEN)
-binance = UMFutures(BINANCE_API_KEY, BINANCE_API_SECRET)
+binance = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 trade_notes = {}
 
 # --- Show Railway IP Address ---
@@ -44,7 +44,7 @@ def calibrate_time_sync(binance):
     for _ in range(10):
         try:
             t0 = time.time() * 1000
-            server_time = int(binance.time()['serverTime'])
+            server_time = int(binance.futures_time()['serverTime'])
             t1 = time.time() * 1000
             offset = server_time - ((t0 + t1) / 2)
             measurements.append(offset)
@@ -94,16 +94,16 @@ def read_alert(alert_text):
     return None
 
 def count_coins(coin, leverage):
-    price = float(binance.ticker_price(coin)['price'])
+    price = float(binance.futures_symbol_ticker(symbol=coin)['price'])
     max_coins = (10 * leverage) / price
     return int(max_coins * 0.75)
 
 def is_still_good(coin):
     try:
-        fr_data = binance.premium_index(symbol=coin)
+        fr_data = binance.futures_premium_index(symbol=coin)
         current_fr = float(fr_data['lastFundingRate'])
         abs_fr = abs(current_fr) * 100
-        lev_data = binance.leverage_bracket(symbol=coin)
+        lev_data = binance.futures_leverage_bracket(symbol=coin)
         leverage = lev_data[0]['brackets'][0]['initialLeverage']
         value = abs_fr * leverage
         return value > 100, value, current_fr
@@ -128,7 +128,7 @@ def make_trade(coin):
     say(LOG_ROOM_ID, f"✅ GO: {coin} {direction} {data['qty']} coins")
 
     try:
-        binance.change_leverage(symbol=coin, leverage=data['leverage'], isIsolated="TRUE")
+        binance.futures_change_leverage(symbol=coin, leverage=data['leverage'])
     except Exception as e:
         say(LOG_ROOM_ID, f"❌ TRADE FAILED: Could not set leverage for {coin}: {e}")
         del trade_notes[coin]
@@ -139,12 +139,11 @@ def make_trade(coin):
     precision_wait(entry_time_ts)
 
     try:
-        binance.new_order(
+        binance.futures_create_order(
             symbol=coin,
             side=direction,
             type="MARKET",
-            quantity=data['qty'],
-            isIsolated="TRUE"
+            quantity=data['qty']
         )
     except Exception as e:
         say(LOG_ROOM_ID, f"❌ TRADE FAILED: Could not open position for {coin}: {e}")
@@ -158,7 +157,7 @@ def make_trade(coin):
     wait_start = time.time()
     while not got_money and (time.time() - wait_start < 10):
         try:
-            money_history = binance.get_income_history(
+            money_history = binance.futures_income_history(
                 symbol=coin,
                 incomeType="FUNDING_FEE",
                 limit=1
@@ -174,12 +173,12 @@ def make_trade(coin):
 
     close_side = "BUY" if direction == "SELL" else "SELL"
     try:
-        binance.new_order(
+        binance.futures_create_order(
             symbol=coin,
             side=close_side,
             type="MARKET",
             quantity=data['qty'],
-            reduceOnly="TRUE"
+            reduceOnly=True
         )
     except Exception as e:
         say(LOG_ROOM_ID, f"❌ TRADE FAILED: Could not close position for {coin}: {e}")
