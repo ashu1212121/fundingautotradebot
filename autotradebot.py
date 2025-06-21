@@ -3,12 +3,8 @@ import os
 import time
 import threading
 import traceback
-from datetime import datetime, timedelta, timezone  # updated import
+from datetime import datetime, timedelta, timezone
 import requests
-
-# --- Immediate stdout/stderr flushing for Railway logs ---
-sys.stdout = os.fdopen(sys.stdout.fileno(), "w", buffering=1)
-sys.stderr = os.fdopen(sys.stderr.fileno(), "w", buffering=1)
 
 print("=== BOT CONTAINER STARTED ===")
 
@@ -31,9 +27,39 @@ except Exception as e:
     traceback.print_exc()
     sys.exit(1)
 
+# --- Check Binance API and Print IP before starting bot ---
+def preflight_binance_check():
+    print("[STEP] Checking Binance API connectivity...")
+    client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+    try:
+        client.futures_account_balance()
+        print("[STEP] Binance API connectivity: OK")
+        return True
+    except BinanceAPIException as e:
+        print(f"[Binance ERROR] {e}")
+        if hasattr(e, "code") and e.code == -2015:
+            try:
+                ip = requests.get("https://api.ipify.org").text.strip()
+                print(f"[Binance ERROR] APIError -2015 (invalid API-key, IP, or permissions).")
+                print(f"[Binance ERROR] Your current public IP is: {ip}")
+                print(f"==> Go whitelist this IP on Binance, then restart the bot.")
+            except Exception as ip_e:
+                print(f"[Binance ERROR] Could not fetch public IP: {ip_e}")
+            sys.exit(1)
+        else:
+            print(f"[Binance ERROR] Unexpected Binance error: {e}")
+            sys.exit(1)
+    except Exception as e:
+        print(f"[Binance ERROR] General error: {e}")
+        sys.exit(1)
+
+# --- Run preflight check before ANYTHING else ---
+preflight_binance_check()
+
+# --- Now safe to import/init Telegram bot ---
 binance = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 trade_notes = {}
-application = None  # Will be set in main()
+application = None
 message_buffer = []
 
 def heartbeat():
@@ -181,9 +207,9 @@ def read_alert(alert_text):
         fr = float(match.group(2))
         leverage = int(match.group(3))
         raw_time = match.group(4)
-        now = datetime.now(timezone.utc)  # updated
+        now = datetime.now(timezone.utc)
         trade_time = datetime.strptime(raw_time, "%H:%M:%S").time()
-        full_time = datetime.combine(now.date(), trade_time).replace(tzinfo=timezone.utc)  # updated
+        full_time = datetime.combine(now.date(), trade_time).replace(tzinfo=timezone.utc)
         if full_time < now:
             full_time += timedelta(days=1)
         return {
@@ -228,7 +254,7 @@ def make_trade(coin):
         data = trade_notes[coin]
 
         check_time = data['time'] - timedelta(minutes=5)
-        check_time_ts = check_time.replace(tzinfo=timezone.utc).timestamp() * 1000  # updated
+        check_time_ts = check_time.replace(tzinfo=timezone.utc).timestamp() * 1000
         precision_wait(check_time_ts)
 
         good, value, current_fr = is_still_good(coin)
@@ -248,7 +274,7 @@ def make_trade(coin):
             return
 
         entry_time = data['time'] - timedelta(seconds=1)
-        entry_time_ts = entry_time.replace(tzinfo=timezone.utc).timestamp() * 1000  # updated
+        entry_time_ts = entry_time.replace(tzinfo=timezone.utc).timestamp() * 1000
         precision_wait(entry_time_ts)
 
         try:
@@ -263,7 +289,7 @@ def make_trade(coin):
             del trade_notes[coin]
             return
 
-        real_entry = datetime.now(timezone.utc)  # updated
+        real_entry = datetime.now(timezone.utc)
 
         got_money = False
         money_bag = 0.0
@@ -361,7 +387,7 @@ def main():
     except Exception as e:
         print(f"Fatal error on startup: {e}")
         traceback.print_exc()
-        say_sync(LOG_ROOM_ID, f"❌ FATAL STARTUP ERROR: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     try:
