@@ -9,8 +9,6 @@ import re
 import asyncio
 import logging
 
-print("=== TRADE BOT CONTAINER STARTED ===")
-
 # --- Configure Logging ---
 logging.basicConfig(
     level=logging.INFO,
@@ -33,7 +31,6 @@ except KeyError as e:
     logger.error(f"❗ ENV ERROR: Missing environment variable: {e}")
     sys.exit(1)
 
-# --- Import with Error Handling ---
 try:
     from binance.client import Client
     from binance.exceptions import BinanceAPIException
@@ -210,13 +207,16 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # 1. Check for "no lead" messages
-        if "no lead found" in cleaned:
+        # --- Robust no-lead detection that ignores @mentions ---
+        cleaned_content = cleaned.replace("@autofundingtradebot", "").strip()
+        logger.info(f"Content after removing mention: '{cleaned_content}'")
+
+        if "no lead found" in cleaned_content:
             logger.info("No lead pattern detected")
             response = (
                 f"🔄 No trade planned.\n"
                 f"Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}\n"
-                f"Original message: {raw_msg[:100]}..."
+                f"Triggered by: {raw_msg[:100]}..."
             )
             await say(LOG_ROOM_ID, response)
             return
