@@ -103,23 +103,22 @@ async def say(room, message):
             send_telegram_message_sync(room, message)
     except Exception as e:
         logger.error(f"Telegram async send error: {e}")
-        traceback.print_exc()
+        send_telegram_message_sync(room, f"⚠️ ASYNC FAILED: {message}")
 
 async def notify_error(where, error):
     try:
         await say(LOG_ROOM_ID, f"❗ Error in {where}: {type(error).__name__}: {error}")
     except Exception as e:
         logger.error(f"Error notification failed: {e}")
+        send_telegram_message_sync(LOG_ROOM_ID, f"🚨 CRITICAL: Error notification failed: {e}")
 
 # --- Heartbeat System ---
 def heartbeat():
+    """Synchronous heartbeat that doesn't depend on async, never touches async run loop"""
     try:
         now = datetime.now(timezone.utc)
         logger.info(f"[HEARTBEAT] Trade Bot is alive at {now.isoformat()}")
-        try:
-            asyncio.run(say(LOG_ROOM_ID, f"❤️ HEARTBEAT: {now.strftime('%H:%M:%S UTC')}"))
-        except:
-            send_telegram_message_sync(LOG_ROOM_ID, f"❤️ HEARTBEAT: {now.strftime('%H:%M:%S UTC')}")
+        send_telegram_message_sync(LOG_ROOM_ID, f"❤️ HEARTBEAT: {now.strftime('%H:%M:%S UTC')}")
     except Exception as e:
         logger.error(f"Heartbeat failed: {e}")
     finally:
@@ -212,23 +211,18 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # 1. FIRST check for no-trade messages
-        no_lead_phrases = [
-            "no lead",
-            "no trade",
-            "no alert",
-            "not found",
-            "no opportunity",
-            "nothing found",
-            "no setup",
-            "❕",
-            "no lead found"
+        # 1. Check for no-trade messages (robust)
+        no_lead_triggers = [
+            "no lead", "no trade", "no alert", "not found",
+            "no opportunity", "nothing found", "no setup",
+            "no lead found", "no trade found", "no alert found",
+            "❕", "❗", "no trades today", "no alert this check"
         ]
 
         matched_no_lead = None
-        for phrase in no_lead_phrases:
-            if phrase in cleaned:
-                matched_no_lead = phrase
+        for trigger in no_lead_triggers:
+            if trigger in cleaned:
+                matched_no_lead = trigger
                 break
 
         if matched_no_lead:
@@ -240,35 +234,25 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
                 f"Original message: {raw_msg[:100]}..."
             )
             await say(LOG_ROOM_ID, response)
-            # TEMPORARY DEBUG:
-            debug_info = (
-                f"🔍 DEBUG:\n"
-                f"Raw: {raw_msg}\n"
-                f"Cleaned: {cleaned}\n"
-                f"Matched no-lead: {matched_no_lead}\n"
-                f"Contains 'alert:': {'alert:' in cleaned}"
-            )
-            await say(LOG_ROOM_ID, debug_info)
             return
 
-        # 2. THEN check for trade alerts
+        # 2. Check for trade alerts
         if "alert:" in cleaned:
             logger.info("Alert pattern detected")
-            await say(LOG_ROOM_ID, "🚦 Alert pattern detected - would process trade here.")
-            # ... (insert your trade parsing and execution code here) ...
+            alert_data = read_alert(raw_msg)
+            if not alert_data:
+                logger.warning("Alert parsing failed")
+                await say(LOG_ROOM_ID,
+                    f"❗ ALERT PARSE FAILURE: Could not parse trade signal.\n"
+                    f"Message: {raw_msg[:200]}..."
+                )
+                return
+
+            # ... (continue with your alert handling & trade logic) ...
+            await say(LOG_ROOM_ID, f"🚦 Alert pattern detected - would process trade here.")
         else:
             logger.info("No alert pattern detected")
             await say(LOG_ROOM_ID, f"ℹ️ Received non-alert message:\n{raw_msg[:100]}...")
-
-        # TEMPORARY DEBUG: Log pattern matching details (for all messages)
-        debug_info = (
-            f"🔍 DEBUG:\n"
-            f"Raw: {raw_msg}\n"
-            f"Cleaned: {cleaned}\n"
-            f"Matched no-lead: {matched_no_lead}\n"
-            f"Contains 'alert:': {'alert:' in cleaned}"
-        )
-        await say(LOG_ROOM_ID, debug_info)
 
     except Exception as e:
         logger.error(f"Message handling crashed: {e}")
@@ -278,10 +262,6 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     logger.info("Starting main application")
     try:
-        # Explicit event loop setup
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
         app = (
             ApplicationBuilder()
             .token(TELEGRAM_TOKEN)
@@ -298,8 +278,7 @@ def main():
 
         logger.info(f"Handler registered for chat ID: {ALERT_ROOM_ID}")
         logger.info("Starting polling...")
-
-        loop.run_until_complete(app.run_polling())
+        app.run_polling()
 
     except Exception as e:
         logger.critical(f"Fatal error: {e}")
