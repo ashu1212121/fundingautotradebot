@@ -3,12 +3,10 @@ import time
 import threading
 import os
 import requests
-import asyncio
 from datetime import datetime, timedelta
 from binance.client import Client
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
-# ===== GET SECRETS FROM ENVIRONMENT VARIABLES =====
 try:
     TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
     ALERT_ROOM_ID = int(os.environ["ALERT_ROOM_ID"])
@@ -18,32 +16,36 @@ try:
 except KeyError as e:
     print(f"❗ Environment variable missing: {e}")
     exit(1)
-# ==================================================
 
 binance = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 trade_notes = {}
 application = None  # Will be set in main()
 
-# ----- Async/sync message sending -----
 async def say(room, message):
     await application.bot.send_message(chat_id=room, text=message)
 
 def say_sync(room, message):
+    # Schedules message in the running event loop (safe for threads)
     if application is None:
         print(f"(DEBUG) [say_sync] Application not ready. Message was: {message}")
         return
-    try:
+    loop = application.loop
+    if loop and loop.is_running():
         application.create_task(say(room, message))
-    except Exception as e:
-        print(f"(DEBUG) [say_sync] Failed to schedule message: {e}")
+    else:
+        print(f"(DEBUG) [say_sync] No running loop, message not sent: {message}")
 
-# --- Show Railway IP Address ---
-def show_ip():
+async def show_ip_startup():
     try:
         ip = requests.get("https://api.ipify.org").text.strip()
-        say_sync(LOG_ROOM_ID, f"🚦 Railway Public IP: `{ip}`\nWhitelist this IP for Binance API access.")
+        await say(LOG_ROOM_ID, f"🚦 Railway Public IP: `{ip}`\nWhitelist this IP for Binance API access.")
     except Exception as e:
-        say_sync(LOG_ROOM_ID, f"❗ Could not fetch Railway Public IP: {e}")
+        await say(LOG_ROOM_ID, f"❗ Could not fetch Railway Public IP: {e}")
+
+async def on_startup(application):
+    calibrate_time_sync(binance)
+    await show_ip_startup()
+    await say(LOG_ROOM_ID, "🤖 HELLO! I'M YOUR MONEY ROBOT (NOW FASTER, MORE PRECISE, AND SAFER)!")
 
 # --- LATENCY & TIME SYNC ---
 
@@ -235,10 +237,7 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     global application
-    calibrate_time_sync(binance)
-    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    show_ip()
-    say_sync(LOG_ROOM_ID, "🤖 HELLO! I'M YOUR MONEY ROBOT (NOW FASTER, MORE PRECISE, AND SAFER)!")
+    application = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(on_startup).build()
     application.add_handler(MessageHandler(filters.Chat(ALERT_ROOM_ID) & filters.TEXT, handle_message))
     application.run_polling()
 
