@@ -140,9 +140,8 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
         await say(LOG_ROOM_ID, f"🛑 MIRROR FROM ALERT ROOM:\n{msg}")
         print(f"[ALERT MSG MIRRORED] {msg}")
 
-        # --- Robust no-trade planned detection ---
+        # --- FIX: Only remove HTML, then lowercase and trim ---
         cleaned = re.sub(r'<.*?>', '', msg)
-        cleaned = re.sub(r'[^\w\s]', '', cleaned)
         cleaned = cleaned.strip().lower()
         print(f"[DEBUG] Cleaned message: '{cleaned}'")
 
@@ -154,15 +153,23 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
             "no lead identified",
             "no trades today",
             "no alert this check",
-            "no lead this check"
+            "no lead this check",
+            "❕ no lead found"
         ]
-        if any(pattern in cleaned for pattern in no_lead_patterns):
-            await say(LOG_ROOM_ID,
-                f"🔄 No trade planned.\n"
-                f"Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}\n"
-                f"(Alert room message: {msg})"
-            )
-            return
+
+        matched = False
+        for pattern in no_lead_patterns:
+            if pattern in cleaned:
+                print(f"[DEBUG] Matched pattern: '{pattern}'")
+                await say(LOG_ROOM_ID,
+                    f"🔄 No trade planned.\n"
+                    f"Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}\n"
+                    f"(Alert room message: {msg})"
+                )
+                matched = True
+                return
+        if not matched:
+            print(f"[DEBUG] No 'no lead' pattern matched in: '{cleaned}'")
 
         if "alert:" in cleaned:
             alert_data = read_alert(msg)
