@@ -6,7 +6,6 @@ import requests
 import asyncio
 from datetime import datetime, timedelta
 from binance.client import Client
-from telegram import Bot
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
 # ===== GET SECRETS FROM ENVIRONMENT VARIABLES =====
@@ -21,21 +20,22 @@ except KeyError as e:
     exit(1)
 # ==================================================
 
-money_bot = Bot(token=TELEGRAM_TOKEN)
 binance = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 trade_notes = {}
+application = None  # Will be set in main()
 
 # ----- Async/sync message sending -----
 async def say(room, message):
-    await money_bot.send_message(chat_id=room, text=message)
+    await application.bot.send_message(chat_id=room, text=message)
 
 def say_sync(room, message):
+    if application is None:
+        print(f"(DEBUG) [say_sync] Application not ready. Message was: {message}")
+        return
     try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(say(room, message))
-    except RuntimeError:
-        asyncio.run(say(room, message))
-# -------------------------------------
+        application.create_task(say(room, message))
+    except Exception as e:
+        print(f"(DEBUG) [say_sync] Failed to schedule message: {e}")
 
 # --- Show Railway IP Address ---
 def show_ip():
@@ -234,11 +234,11 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
             threading.Timer(wait_time, make_trade, [coin]).start()
 
 def main():
+    global application
     calibrate_time_sync(binance)
+    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     show_ip()
     say_sync(LOG_ROOM_ID, "🤖 HELLO! I'M YOUR MONEY ROBOT (NOW FASTER, MORE PRECISE, AND SAFER)!")
-
-    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     application.add_handler(MessageHandler(filters.Chat(ALERT_ROOM_ID) & filters.TEXT, handle_message))
     application.run_polling()
 
