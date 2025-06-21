@@ -25,15 +25,25 @@ money_bot = Bot(token=TELEGRAM_TOKEN)
 binance = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 trade_notes = {}
 
+# ----- Async/sync message sending -----
+async def say(room, message):
+    await money_bot.send_message(chat_id=room, text=message)
+
+def say_sync(room, message):
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(say(room, message))
+    except RuntimeError:
+        asyncio.run(say(room, message))
+# -------------------------------------
+
 # --- Show Railway IP Address ---
 def show_ip():
     try:
         ip = requests.get("https://api.ipify.org").text.strip()
-        print(f"🚦 Railway Public IP: {ip}")
-        money_bot.send_message(chat_id=LOG_ROOM_ID, text=f"🚦 Railway Public IP: `{ip}`\nWhitelist this IP for Binance API access.", parse_mode="Markdown")
+        say_sync(LOG_ROOM_ID, f"🚦 Railway Public IP: `{ip}`\nWhitelist this IP for Binance API access.")
     except Exception as e:
-        print("Could not fetch public IP:", e)
-        money_bot.send_message(chat_id=LOG_ROOM_ID, text=f"❗ Could not fetch Railway Public IP: {e}")
+        say_sync(LOG_ROOM_ID, f"❗ Could not fetch Railway Public IP: {e}")
 
 # --- LATENCY & TIME SYNC ---
 
@@ -65,9 +75,6 @@ def precision_wait(target_ts_ms):
             return
         remaining = target_ts_ms - current
         time.sleep(max(remaining / 2000, 0.001))
-
-def say(room, message):
-    money_bot.send_message(chat_id=room, text=message)
 
 def read_alert(alert_text):
     pattern = (
@@ -109,7 +116,7 @@ def is_still_good(coin):
         value = abs_fr * leverage
         return value > 100, value, current_fr
     except Exception as e:
-        say(LOG_ROOM_ID, f"❌ ERROR: Pre-check for {coin} failed: {e}")
+        say_sync(LOG_ROOM_ID, f"❌ ERROR: Pre-check for {coin} failed: {e}")
         return False, 0, 0
 
 def make_trade(coin):
@@ -121,17 +128,17 @@ def make_trade(coin):
 
     good, value, current_fr = is_still_good(coin)
     if not good:
-        say(LOG_ROOM_ID, f"🚫 STOP: {coin} now {value:.2f}")
+        say_sync(LOG_ROOM_ID, f"🚫 STOP: {coin} now {value:.2f}")
         del trade_notes[coin]
         return
 
     direction = "SELL" if current_fr > 0 else "BUY"
-    say(LOG_ROOM_ID, f"✅ GO: {coin} {direction} {data['qty']} coins")
+    say_sync(LOG_ROOM_ID, f"✅ GO: {coin} {direction} {data['qty']} coins")
 
     try:
         binance.futures_change_leverage(symbol=coin, leverage=data['leverage'])
     except Exception as e:
-        say(LOG_ROOM_ID, f"❌ TRADE FAILED: Could not set leverage for {coin}: {e}")
+        say_sync(LOG_ROOM_ID, f"❌ TRADE FAILED: Could not set leverage for {coin}: {e}")
         del trade_notes[coin]
         return
 
@@ -147,7 +154,7 @@ def make_trade(coin):
             quantity=data['qty']
         )
     except Exception as e:
-        say(LOG_ROOM_ID, f"❌ TRADE FAILED: Could not open position for {coin}: {e}")
+        say_sync(LOG_ROOM_ID, f"❌ TRADE FAILED: Could not open position for {coin}: {e}")
         del trade_notes[coin]
         return
 
@@ -168,7 +175,7 @@ def make_trade(coin):
                 money_bag = float(money_history[0]['income'])
                 break
         except Exception as e:
-            say(LOG_ROOM_ID, f"❌ ERROR: Funding fee check for {coin} failed: {e}")
+            say_sync(LOG_ROOM_ID, f"❌ ERROR: Funding fee check for {coin} failed: {e}")
             break
         time.sleep(0.1)
 
@@ -182,11 +189,11 @@ def make_trade(coin):
             reduceOnly=True
         )
     except Exception as e:
-        say(LOG_ROOM_ID, f"❌ TRADE FAILED: Could not close position for {coin}: {e}")
+        say_sync(LOG_ROOM_ID, f"❌ TRADE FAILED: Could not close position for {coin}: {e}")
         del trade_notes[coin]
         return
 
-    say(LOG_ROOM_ID,
+    say_sync(LOG_ROOM_ID,
         f"💰 DONE: {coin}\n"
         f"▫️ Money: {'✅' if got_money else '❌'} {money_bag:.6f} USDT\n"
         f"▫️ Time: {datetime.utcnow().strftime('%H:%M:%S')} UTC")
@@ -196,7 +203,7 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message.text
 
     if "❕ No lead found" in msg:
-        say(LOG_ROOM_ID,
+        await say(LOG_ROOM_ID,
             f"🔄 NO TRADE NOW\n"
             f"▫️ Time: {datetime.utcnow().strftime('%H:%M:%S UTC')}\n"
             f"▫️ Robot is awake!")
@@ -209,7 +216,7 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 qty = count_coins(coin, alert_data["leverage"])
             except Exception as e:
-                say(LOG_ROOM_ID, f"❌ TRADE FAILED: Could not count coins for {coin}: {e}")
+                await say(LOG_ROOM_ID, f"❌ TRADE FAILED: Could not count coins for {coin}: {e}")
                 return
 
             trade_notes[coin] = {
@@ -218,7 +225,7 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
                 'time': alert_data["time"]
             }
 
-            say(LOG_ROOM_ID,
+            await say(LOG_ROOM_ID,
                 f"🔔 NEW: {coin}\n"
                 f"▫️ Qty: {qty}\n"
                 f"▫️ Check at {(alert_data['time']-timedelta(minutes=5)).strftime('%H:%M:%S')} UTC")
@@ -229,7 +236,7 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     calibrate_time_sync(binance)
     show_ip()
-    say(LOG_ROOM_ID, "🤖 HELLO! I'M YOUR MONEY ROBOT (NOW FASTER, MORE PRECISE, AND SAFER)!")
+    say_sync(LOG_ROOM_ID, "🤖 HELLO! I'M YOUR MONEY ROBOT (NOW FASTER, MORE PRECISE, AND SAFER)!")
 
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     application.add_handler(MessageHandler(filters.Chat(ALERT_ROOM_ID) & filters.TEXT, handle_message))
