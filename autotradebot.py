@@ -3,7 +3,7 @@ import os
 import time
 import threading
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone  # updated import
 import requests
 
 # --- Immediate stdout/stderr flushing for Railway logs ---
@@ -23,7 +23,6 @@ except KeyError as e:
     print(f"❗ ENV ERROR: Missing environment variable: {e}")
     sys.exit(1)
 
-# --- Telegram and Binance imports (import after env check for clean error logs) ---
 try:
     from binance.client import Client, BinanceAPIException
     from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
@@ -38,20 +37,18 @@ application = None  # Will be set in main()
 message_buffer = []
 
 def heartbeat():
-    print(f"[HEARTBEAT] Bot is alive at {datetime.utcnow().isoformat()}")
+    print(f"[HEARTBEAT] Bot is alive at {datetime.now(timezone.utc).isoformat()}")
     threading.Timer(60, heartbeat).start()
 heartbeat()
 
-# --- Logging and Messaging Utilities ---
-
 def log_step(step):
-    now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
     msg = f"[STEP {now}] {step}"
     print(msg)
     say_sync(LOG_ROOM_ID, msg)
 
 def log_error(where, e, extra=None):
-    now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
     msg = f"❌ ERROR in {where}: {type(e).__name__}: {e}"
     print(msg)
     if extra:
@@ -72,7 +69,6 @@ async def say(room, message):
 
 def say_sync(room, message):
     print(f"[Log to {room}] {message}")
-    # If the event loop isn't running, buffer the message for later
     if application is None or not hasattr(application, "loop") or not application.loop.is_running():
         message_buffer.append((room, message))
         print(f"[Buffered] Message buffered until event loop starts.")
@@ -88,8 +84,6 @@ async def flush_message_buffer():
     while message_buffer:
         room, message = message_buffer.pop(0)
         await say(room, message)
-
-# --- Balance Check ---
 
 def check_balance_sync():
     log_step("Starting check_balance_sync")
@@ -119,8 +113,6 @@ def check_balance_sync():
         log_error("check_balance_sync", e)
         return 0
 
-# --- Show Railway IP Address ---
-
 async def show_ip_startup():
     log_step("Fetching Railway Public IP")
     try:
@@ -129,8 +121,6 @@ async def show_ip_startup():
     except Exception as e:
         await say(LOG_ROOM_ID, f"❗ Could not fetch Railway Public IP: {e}")
         log_error("show_ip_startup", e)
-
-# --- Startup Handler ---
 
 async def on_startup(application):
     try:
@@ -144,8 +134,6 @@ async def on_startup(application):
         log_step("on_startup finished")
     except Exception as e:
         log_error("on_startup", e)
-
-# --- LATENCY & TIME SYNC ---
 
 time_offset = 0.0
 
@@ -193,9 +181,9 @@ def read_alert(alert_text):
         fr = float(match.group(2))
         leverage = int(match.group(3))
         raw_time = match.group(4)
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)  # updated
         trade_time = datetime.strptime(raw_time, "%H:%M:%S").time()
-        full_time = datetime.combine(now.date(), trade_time)
+        full_time = datetime.combine(now.date(), trade_time).replace(tzinfo=timezone.utc)  # updated
         if full_time < now:
             full_time += timedelta(days=1)
         return {
@@ -236,11 +224,11 @@ def is_still_good(coin):
 def make_trade(coin):
     try:
         log_step(f"make_trade started for {coin}")
-        check_balance_sync()  # check balance before trade
+        check_balance_sync()
         data = trade_notes[coin]
 
         check_time = data['time'] - timedelta(minutes=5)
-        check_time_ts = check_time.replace(tzinfo=None).timestamp() * 1000
+        check_time_ts = check_time.replace(tzinfo=timezone.utc).timestamp() * 1000  # updated
         precision_wait(check_time_ts)
 
         good, value, current_fr = is_still_good(coin)
@@ -260,7 +248,7 @@ def make_trade(coin):
             return
 
         entry_time = data['time'] - timedelta(seconds=1)
-        entry_time_ts = entry_time.replace(tzinfo=None).timestamp() * 1000
+        entry_time_ts = entry_time.replace(tzinfo=timezone.utc).timestamp() * 1000  # updated
         precision_wait(entry_time_ts)
 
         try:
@@ -275,7 +263,7 @@ def make_trade(coin):
             del trade_notes[coin]
             return
 
-        real_entry = datetime.utcnow()
+        real_entry = datetime.now(timezone.utc)  # updated
 
         got_money = False
         money_bag = 0.0
@@ -313,9 +301,9 @@ def make_trade(coin):
         say_sync(LOG_ROOM_ID,
             f"💰 DONE: {coin}\n"
             f"▫️ Money: {'✅' if got_money else '❌'} {money_bag:.6f} USDT\n"
-            f"▫️ Time: {datetime.utcnow().strftime('%H:%M:%S')} UTC")
+            f"▫️ Time: {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC")
         del trade_notes[coin]
-        check_balance_sync()  # check after trade
+        check_balance_sync()
         log_step(f"make_trade finished for {coin}")
     except Exception as e:
         log_error("make_trade", e)
@@ -323,14 +311,13 @@ def make_trade(coin):
 async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
     try:
         msg = update.message.text
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
-        print(f"[DEBUG {now}] Received in alert room: {msg!r}")  # Debug log for every received message
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        print(f"[DEBUG {now}] Received in alert room: {msg!r}")
 
-        # Flexible matching for "no lead found"
         if msg and "no lead found" in msg.lower():
             await say(LOG_ROOM_ID,
                 f"🔄 NO TRADE NOW\n"
-                f"▫️ Time: {datetime.utcnow().strftime('%H:%M:%S UTC')}\n"
+                f"▫️ Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}\n"
                 f"▫️ Robot is awake!")
             log_step("NO TRADE NOW message sent")
             return
@@ -357,7 +344,7 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
                     f"▫️ Qty: {qty}\n"
                     f"▫️ Check at {(alert_data['time']-timedelta(minutes=5)).strftime('%H:%M:%S')} UTC")
                 log_step(f"Trade note set for {coin}, timer for make_trade started")
-                wait_time = (alert_data['time'] - timedelta(minutes=5) - datetime.utcnow()).total_seconds()
+                wait_time = (alert_data['time'] - timedelta(minutes=5) - datetime.now(timezone.utc)).total_seconds()
                 threading.Timer(wait_time, make_trade, [coin]).start()
     except Exception as e:
         log_error("handle_message", e, extra=f"Message: {update.message.text}")
