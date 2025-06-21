@@ -164,14 +164,15 @@ def is_still_good(coin):
         return False, 0, 0
 
 def read_alert(alert_text):
-    pattern = (
-        r"ALERT:\s*(\w+)[^A-Za-z0-9]+"
-        r"Funding Rate:\s*([-+]?\d*\.?\d+)%[^A-Za-z0-9]+"
-        r"Max Leverage:\s*(\d+)x[^A-Za-z0-9]+"
+    # Compatible with new alert bot format
+    pat = (
+        r"ALERT:\s*(\w+)\s*[\r\n]+"
+        r"Funding Rate:\s*([-+]?\d*\.?\d+)%[\r\n]+"
+        r"Max Leverage:\s*(\d+)x[\r\n]+"
         r"Next window:\s*([\d]{2}:[\d]{2}:[\d]{2})"
     )
     cleaned = re.sub(r'<.*?>', '', alert_text)
-    match = re.search(pattern, cleaned, re.DOTALL | re.IGNORECASE)
+    match = re.search(pat, cleaned, re.DOTALL | re.IGNORECASE)
     if match:
         coin = match.group(1)
         fr = float(match.group(2))
@@ -195,14 +196,12 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
         raw_msg = update.message.text or ""
         logger.info(f"Received message: {raw_msg}")
 
-        # Immediately mirror the raw message
+        # Mirror the raw message
         await say(LOG_ROOM_ID, f"🛑 MIRROR FROM ALERT ROOM:\n{raw_msg}")
 
-        # Basic cleaning for pattern matching - ONLY lowercase, no stripping
         cleaned = raw_msg.lower()
         logger.info(f"Cleaned message: '{cleaned}'")
 
-        # Verify message source
         if update.message.chat.id != ALERT_ROOM_ID:
             logger.warning(f"Received message from unexpected chat: {update.message.chat.id}")
             await say(LOG_ROOM_ID,
@@ -211,32 +210,18 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # 1. Check for no-trade messages (robust)
-        no_lead_triggers = [
-            "no lead", "no trade", "no alert", "not found",
-            "no opportunity", "nothing found", "no setup",
-            "no lead found", "no trade found", "no alert found",
-            "❕", "❗", "no trades today", "no alert this check"
-        ]
-
-        matched_no_lead = None
-        for trigger in no_lead_triggers:
-            if trigger in cleaned:
-                matched_no_lead = trigger
-                break
-
-        if matched_no_lead:
-            logger.info(f"No lead pattern detected: matched '{matched_no_lead}'")
+        # 1. Check for "no lead" messages
+        if "no lead found" in cleaned:
+            logger.info("No lead pattern detected")
             response = (
                 f"🔄 No trade planned.\n"
                 f"Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}\n"
-                f"Matched pattern: '{matched_no_lead}'\n"
                 f"Original message: {raw_msg[:100]}..."
             )
             await say(LOG_ROOM_ID, response)
             return
 
-        # 2. Check for trade alerts
+        # 2. Check for alert messages
         if "alert:" in cleaned:
             logger.info("Alert pattern detected")
             alert_data = read_alert(raw_msg)
@@ -248,8 +233,63 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-            # ... (continue with your alert handling & trade logic) ...
-            await say(LOG_ROOM_ID, f"🚦 Alert pattern detected - would process trade here.")
+            coin = alert_data["coin"]
+            leverage = alert_data["leverage"]
+            funding_time = alert_data["time"]
+            now = datetime.now(timezone.utc)
+
+            qty = count_coins(coin, leverage)
+            if qty == 0:
+                logger.error(f"Coin count failed for {coin}")
+                await say(LOG_ROOM_ID, f"❌ Trade failed: Could not count coins for {coin}.")
+                return
+
+            try:
+                binance.futures_change_leverage(symbol=coin, leverage=leverage)
+                fr_data = binance.futures_premium_index(symbol=coin)
+                current_fr = float(fr_data['lastFundingRate'])
+                direction = "SELL" if current_fr > 0 else "BUY"
+            except Exception as e:
+                logger.error(f"Pre-trade checks failed: {e}")
+                await notify_error("handle_message (pre-checks)", e)
+                return
+
+            entry_time = funding_time - timedelta(seconds=1)
+            check_time = entry_time - timedelta(minutes=5)
+            time_remaining = (entry_time - now).total_seconds()
+
+            if time_remaining <= 0:
+                logger.warning("Entry time already passed")
+                await say(LOG_ROOM_ID, "⚠️ Entry time already passed. Trade cancelled.")
+                return
+
+            await say(
+                LOG_ROOM_ID,
+                f"🔔 New trade planned: {coin}\n"
+                f"Direction: {direction}\n"
+                f"Qty: {qty}\n"
+                f"Entry at {entry_time.strftime('%H:%M:%S')} UTC\n"
+                f"⏳ Time remaining: {timedelta(seconds=int(time_remaining))}"
+            )
+
+            def schedule_trade():
+                try:
+                    time.sleep(max(0, (check_time - datetime.now(timezone.utc)).total_seconds()))
+                    good, value, current_fr2 = is_still_good(coin)
+                    if not good:
+                        asyncio.run(say(LOG_ROOM_ID,
+                            f"❌ Trade cancelled: Funding not good enough for {coin}\n"
+                            f"Current value: {value:.2f} (need >100)"
+                        ))
+                        return
+                    time.sleep(max(0, (entry_time - datetime.now(timezone.utc)).total_seconds()))
+                    asyncio.run(execute_trade(coin, qty, direction, funding_time))
+                except Exception as e:
+                    logger.error(f"Trade scheduling failed: {e}")
+                    asyncio.run(notify_error("schedule_trade", e))
+
+            threading.Thread(target=schedule_trade, daemon=True).start()
+
         else:
             logger.info("No alert pattern detected")
             await say(LOG_ROOM_ID, f"ℹ️ Received non-alert message:\n{raw_msg[:100]}...")
@@ -258,7 +298,62 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Message handling crashed: {e}")
         await notify_error("handle_message", e)
 
-# --- Main Application ---
+async def execute_trade(coin, qty, direction, funding_time):
+    try:
+        logger.info(f"Executing trade: {coin} {direction} {qty}")
+        await say(LOG_ROOM_ID, f"⏳ Executing {direction} order for {qty} {coin}...")
+
+        entry_order = binance.futures_create_order(
+            symbol=coin,
+            side=direction,
+            type="MARKET",
+            quantity=qty
+        )
+        entry_time = datetime.now(timezone.utc)
+        await say(LOG_ROOM_ID, f"🚀 {coin} {direction} order placed at {entry_time.strftime('%H:%M:%S')} UTC")
+
+        # Wait for funding fee
+        found_fee = False
+        money_bag = 0.0
+        funding_ts_ms = int(funding_time.timestamp() * 1000)
+
+        await say(LOG_ROOM_ID, "⏳ Waiting for funding fee...")
+        for _ in range(30):  # 30 attempts with 1s delay = 30s total
+            try:
+                history = binance.futures_income_history(
+                    symbol=coin,
+                    incomeType="FUNDING_FEE",
+                    limit=1
+                )
+                if history and int(history[0]['time']) >= funding_ts_ms:
+                    found_fee = True
+                    money_bag = float(history[0]['income'])
+                    break
+            except Exception as e:
+                logger.warning(f"Funding fee check failed: {e}")
+            time.sleep(1)
+
+        close_side = "BUY" if direction == "SELL" else "SELL"
+        try:
+            binance.futures_create_order(
+                symbol=coin,
+                side=close_side,
+                type="MARKET",
+                quantity=qty,
+                reduceOnly=True
+            )
+            await say(LOG_ROOM_ID, f"✅ {coin} position closed")
+        except Exception as e:
+            await notify_error("execute_trade (close position)", e)
+
+        if found_fee:
+            await say(LOG_ROOM_ID, f"💰 Funding fee received: {money_bag:.6f} USDT")
+        else:
+            await say(LOG_ROOM_ID, f"⚠️ Funding fee not detected within 30s")
+
+    except Exception as e:
+        await notify_error("execute_trade", e)
+
 def main():
     logger.info("Starting main application")
     try:
