@@ -27,6 +27,7 @@ try:
     BINANCE_API_KEY = os.environ["BINANCE_API_KEY"]
     BINANCE_API_SECRET = os.environ["BINANCE_API_SECRET"]
     logger.info("Environment variables loaded successfully")
+    logger.info(f"ENV: TELEGRAM_TOKEN: {TELEGRAM_TOKEN[:6]}..., ALERT_ROOM_ID: {ALERT_ROOM_ID}, LOG_ROOM_ID: {LOG_ROOM_ID}")
 except KeyError as e:
     logger.error(f"❗ ENV ERROR: Missing environment variable: {e}")
     sys.exit(1)
@@ -74,7 +75,6 @@ binance = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 
 # --- Telegram Utilities ---
 def send_telegram_message_sync(room_id, message):
-    """Synchronous Telegram message sender for non-async contexts"""
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {
@@ -90,7 +90,6 @@ def send_telegram_message_sync(room_id, message):
         logger.error(f"Telegram sync send error: {e}")
 
 async def say(room, message):
-    """Asynchronous Telegram message sender"""
     global application
     try:
         if application and hasattr(application, "bot"):
@@ -111,7 +110,6 @@ async def notify_error(where, error):
 
 # --- Heartbeat System ---
 def heartbeat():
-    """Synchronous heartbeat that doesn't depend on async, never touches async run loop"""
     try:
         now = datetime.now(timezone.utc)
         logger.info(f"[HEARTBEAT] Trade Bot is alive at {now.isoformat()}")
@@ -161,7 +159,6 @@ def is_still_good(coin):
         return False, 0, 0
 
 def read_alert(alert_text):
-    # Compatible with new alert bot format
     pat = (
         r"ALERT:\s*(\w+)\s*[\r\n]+"
         r"Funding Rate:\s*([-+]?\d*\.?\d+)%[\r\n]+"
@@ -188,26 +185,33 @@ def read_alert(alert_text):
         }
     return None
 
+# --- DIAGNOSIS DEBUG HANDLER ---
+async def debug_logger(update, context):
+    # This will log every message the bot receives, regardless of chat
+    message_text = getattr(update.message, "text", None)
+    logger.info(f"DEBUG: Received message from chat id {getattr(update.message.chat, 'id', None)}: {message_text}")
+
+# --- Main Message Handler ---
 async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
     try:
         raw_msg = update.message.text or ""
-        logger.info(f"Received message: {raw_msg}")
+        chat_id = update.message.chat.id
+        logger.info(f"handle_message: Received message from chat id {chat_id}: {raw_msg}")
 
         # Mirror the raw message
-        await say(LOG_ROOM_ID, f"🛑 MIRROR FROM ALERT ROOM:\n{raw_msg}")
+        await say(LOG_ROOM_ID, f"🛑 MIRROR FROM CHAT {chat_id}:\n{raw_msg}")
 
         cleaned = raw_msg.lower()
         logger.info(f"Cleaned message: '{cleaned}'")
 
-        if update.message.chat.id != ALERT_ROOM_ID:
-            logger.warning(f"Received message from unexpected chat: {update.message.chat.id}")
+        if chat_id != ALERT_ROOM_ID:
+            logger.warning(f"Received message from unexpected chat: {chat_id}")
             await say(LOG_ROOM_ID,
-                f"⚠️ Received message from unknown chat: {update.message.chat.id}\n"
+                f"⚠️ Received message from unknown chat: {chat_id}\n"
                 f"Expected: {ALERT_ROOM_ID}"
             )
             return
 
-        # --- Robust no-lead detection that ignores @mentions ---
         cleaned_content = cleaned.replace("@autofundingtradebot", "").strip()
         logger.info(f"Content after removing mention: '{cleaned_content}'")
 
@@ -221,7 +225,6 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
             await say(LOG_ROOM_ID, response)
             return
 
-        # 2. Check for alert messages
         if "alert:" in cleaned:
             logger.info("Alert pattern detected")
             alert_data = read_alert(raw_msg)
@@ -312,7 +315,6 @@ async def execute_trade(coin, qty, direction, funding_time):
         entry_time = datetime.now(timezone.utc)
         await say(LOG_ROOM_ID, f"🚀 {coin} {direction} order placed at {entry_time.strftime('%H:%M:%S')} UTC")
 
-        # Wait for funding fee
         found_fee = False
         money_bag = 0.0
         funding_ts_ms = int(funding_time.timestamp() * 1000)
@@ -364,9 +366,13 @@ def main():
             .build()
         )
 
+        # Debug handler: logs every single incoming message to Railway log
+        app.add_handler(MessageHandler(filters.ALL, debug_logger))
+
+        # Main handler: only reacts to text messages (from any chat)
         app.add_handler(
             MessageHandler(
-                filters.Chat(chat_id=ALERT_ROOM_ID) & filters.TEXT,
+                filters.TEXT,
                 handle_message
             )
         )
