@@ -21,7 +21,7 @@ IST = timezone(timedelta(hours=5, minutes=30))  # Indian Standard Time
 class PrecisionFuturesTrader:
     def __init__(self):
         self.SYMBOL = 'HYPERUSDT'  # Trading pair
-        self.FIXED_QTY = 1050      # Quantity (fixed at 1050 HYPER)
+        self.FIXED_QTY = 1350      # Quantity (fixed at 1050 HYPER)
         self.LEVERAGE = 75         # Leverage fixed at 75x
         # 10:29:59.200 PM IST (22:29:59.200)
         self.ENTRY_TIME = (22, 29, 59, 200000)  
