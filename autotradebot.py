@@ -194,15 +194,15 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
     try:
         raw_msg = update.message.text or ""
         chat_id = update.message.chat.id
-        logger.info(f"handle_message: Received message from chat id {chat_id}: {raw_msg}")
+        logger.info(f"[HANDLE] Received message from chat id {chat_id}: {raw_msg}")
 
         await say(LOG_ROOM_ID, f"🛑 MIRROR FROM CHAT {chat_id}:\n{raw_msg}")
 
         cleaned = raw_msg.lower()
-        logger.info(f"Cleaned message: '{cleaned}'")
+        logger.info(f"[HANDLE] Cleaned message: '{cleaned}'")
 
         if chat_id != ALERT_ROOM_ID:
-            logger.warning(f"Received message from unexpected chat: {chat_id}")
+            logger.warning(f"[HANDLE] Received message from unexpected chat: {chat_id}")
             await say(LOG_ROOM_ID,
                 f"⚠️ Received message from unknown chat: {chat_id}\n"
                 f"Expected: {ALERT_ROOM_ID}"
@@ -210,10 +210,10 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         cleaned_content = cleaned.replace("@autofundingtradebot", "").strip()
-        logger.info(f"Content after removing mention: '{cleaned_content}'")
+        logger.info(f"[HANDLE] Content after removing mention: '{cleaned_content}'")
 
         if "no lead found" in cleaned_content:
-            logger.info("No lead pattern detected")
+            logger.info("[HANDLE] No lead pattern detected")
             response = (
                 f"🔄 No trade planned.\n"
                 f"Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}\n"
@@ -223,16 +223,17 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if "alert:" in cleaned:
-            logger.info("Alert pattern detected")
+            logger.info("[HANDLE] Alert pattern detected")
             alert_data = read_alert(raw_msg)
             if not alert_data:
-                logger.warning("Alert parsing failed")
+                logger.warning("[HANDLE] Alert parsing failed")
                 await say(LOG_ROOM_ID,
                     f"❗ ALERT PARSE FAILURE: Could not parse trade signal.\n"
                     f"Message: {raw_msg[:200]}..."
                 )
                 return
 
+            logger.info(f"[HANDLE] Alert parsed OK: {alert_data}")
             coin = alert_data["coin"]
             leverage = alert_data["leverage"]
             funding_time = alert_data["time"]
@@ -306,7 +307,7 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
             threading.Thread(target=schedule_trade, daemon=True).start()
 
         else:
-            logger.info("No alert pattern detected")
+            logger.info("[HANDLE] No alert pattern detected")
             await say(LOG_ROOM_ID, f"ℹ️ Received non-alert message:\n{raw_msg[:100]}...")
 
     except Exception as e:
