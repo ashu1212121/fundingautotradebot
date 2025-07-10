@@ -1,9 +1,14 @@
-from binance import AsyncClient
 import os
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 import time
+import aiohttp
+import hmac
+import hashlib
+import urllib.parse
+
+from binance import AsyncClient
 
 # Configure logging with milliseconds
 logging.basicConfig(
@@ -18,13 +23,40 @@ logging.basicConfig(
 
 IST = timezone(timedelta(hours=5, minutes=30))  # Indian Standard Time
 
+async def async_futures_transfer(api_key, api_secret, asset, amount, type_):
+    """
+    Custom async function to transfer from Futures to Spot using Binance REST API.
+    """
+    base_url = "https://api.binance.com"
+    endpoint = "/sapi/v1/futures/transfer"
+    timestamp = int(time.time() * 1000)
+    params = {
+        "asset": asset,
+        "amount": amount,
+        "type": type_,
+        "timestamp": timestamp
+    }
+    query_string = urllib.parse.urlencode(params)
+    signature = hmac.new(
+        api_secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256
+    ).hexdigest()
+    headers = {"X-MBX-APIKEY": api_key}
+    url = f"{base_url}{endpoint}?{query_string}&signature={signature}"
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers) as resp:
+            data = await resp.json()
+            if resp.status != 200:
+                raise Exception(f"Binance transfer failed: {data}")
+            return data
+
 class PrecisionFuturesTrader:
     def __init__(self):
         self.SYMBOL = 'HYPERUSDT'  # Trading pair
-        self.FIXED_QTY = 1350      # Quantity (fixed at 1050 HYPER)
+        self.FIXED_QTY = 1050      # Quantity (fixed at 1050 HYPER)
         self.LEVERAGE = 75         # Leverage fixed at 75x
-        # 10:29:59.200 PM IST (22:29:59.200)
-        self.ENTRY_TIME = (22, 29, 59, 200000)  
+        # 11:29:59.200 PM IST (23:29:59.200)
+        self.ENTRY_TIME = (23, 29, 59, 200000)  
         self.time_offset = 0.0
         self.entry_time = None
         self.liquidation_price = None
@@ -79,6 +111,7 @@ class PrecisionFuturesTrader:
         return time.time() * 1000 + self.time_offset  # ms
 
     def _calculate_target(self, hour, minute, second, microsecond):
+        # Get current server time in IST, then adjust to target time
         now = datetime.fromtimestamp(self._get_server_time() / 1000, IST)
         target = now.replace(
             hour=hour,
@@ -86,6 +119,9 @@ class PrecisionFuturesTrader:
             second=second,
             microsecond=microsecond
         )
+        # If target time already passed today, schedule for tomorrow
+        if target < now:
+            target += timedelta(days=1)
         return target.timestamp() * 1000  # ms
 
     async def _precision_wait(self, target_ts):
@@ -128,17 +164,15 @@ class PrecisionFuturesTrader:
             logging.error(f"Failed to execute market {side} order: {e}")
             raise
 
-    async def _transfer_funding_fee(self, async_client, funding_income):
+    async def _transfer_funding_fee(self, api_key, api_secret, funding_income):
         try:
             # Only attempt transfer if funding_income > 1
             income_amount = float(funding_income)
             if income_amount > 1:
                 transfer_amount = round(income_amount - 1, 8)  # up to 8 decimals for USDT
                 # type=2 means transfer from USDT-M Futures to Spot
-                transfer_result = await async_client.futures_transfer(
-                    asset='USDT',
-                    amount=transfer_amount,
-                    type=2
+                transfer_result = await async_futures_transfer(
+                    api_key, api_secret, 'USDT', transfer_amount, 2
                 )
                 logging.info(f"Transferred {transfer_amount} USDT from Futures to Spot: {transfer_result}")
             else:
@@ -146,7 +180,7 @@ class PrecisionFuturesTrader:
         except Exception as e:
             logging.error(f"Failed to transfer funding fee to spot: {e}")
 
-    async def _monitor_funding_fee_and_sell(self, async_client):
+    async def _monitor_funding_fee_and_sell(self, async_client, api_key, api_secret):
         """Monitor funding fee, then attempt to transfer funding fee and close position without risk of opening a short."""
         try:
             while True:
@@ -163,7 +197,7 @@ class PrecisionFuturesTrader:
                         # Start transfer and exit concurrently
                         funding_income = income.get('income', '0')
                         transfer_task = asyncio.create_task(
-                            self._transfer_funding_fee(async_client, funding_income)
+                            self._transfer_funding_fee(api_key, api_secret, funding_income)
                         )
                         sell_task = asyncio.create_task(
                             self._execute_order(
@@ -185,9 +219,9 @@ class PrecisionFuturesTrader:
             raise
 
     async def execute_strategy(self):
-        async_client = await AsyncClient.create(
-            os.getenv('BINANCE_API_KEY'), os.getenv('BINANCE_API_SECRET')
-        )
+        api_key = os.getenv('BINANCE_API_KEY')
+        api_secret = os.getenv('BINANCE_API_SECRET')
+        async_client = await AsyncClient.create(api_key, api_secret)
         try:
             await self._verify_connection(async_client)
             await self._set_leverage_and_margin_type(async_client)
@@ -203,7 +237,7 @@ class PrecisionFuturesTrader:
                 logging.info(f"Liquidation price after entry: {self.liquidation_price}")
             else:
                 logging.warning("Could not fetch liquidation price after entry.")
-            await self._monitor_funding_fee_and_sell(async_client)
+            await self._monitor_funding_fee_and_sell(async_client, api_key, api_secret)
         except Exception as e:
             logging.error(f"Strategy failed: {e}")
         finally:
