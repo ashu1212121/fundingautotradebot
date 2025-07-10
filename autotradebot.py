@@ -12,10 +12,8 @@ import logging
 # --- Configure Logging ---
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger("TradeBot")
 
@@ -27,7 +25,9 @@ try:
     BINANCE_API_KEY = os.environ["BINANCE_API_KEY"]
     BINANCE_API_SECRET = os.environ["BINANCE_API_SECRET"]
     logger.info("Environment variables loaded successfully")
-    logger.info(f"ENV: TELEGRAM_TOKEN: {TELEGRAM_TOKEN[:6]}..., ALERT_ROOM_ID: {ALERT_ROOM_ID}, LOG_ROOM_ID: {LOG_ROOM_ID}")
+    logger.info(
+        f"ENV: TELEGRAM_TOKEN: {TELEGRAM_TOKEN[:6]}..., ALERT_ROOM_ID: {ALERT_ROOM_ID}, LOG_ROOM_ID: {LOG_ROOM_ID}"
+    )
 except KeyError as e:
     logger.error(f"❗ ENV ERROR: Missing environment variable: {e}")
     sys.exit(1)
@@ -77,10 +77,7 @@ binance = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 def send_telegram_message_sync(room_id, message):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": room_id,
-            "text": message
-        }
+        payload = {"chat_id": room_id, "text": message}
         response = requests.post(url, json=payload)
         if response.status_code == 200:
             logger.info(f"Telegram message sent to room {room_id}")
@@ -301,7 +298,10 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
                     asyncio.run(execute_trade(coin, qty, direction, funding_time))
                 except Exception as e:
                     logger.error(f"[SCHEDULE ERROR] Trade scheduling failed for {coin}: {e}\n{traceback.format_exc()}")
-                    asyncio.run(notify_error("schedule_trade", e))
+                    try:
+                        asyncio.run(notify_error("schedule_trade", e))
+                    except Exception as notify_exc:
+                        logger.error(f"[SCHEDULE ERROR] notify_error failed: {notify_exc}")
 
             threading.Thread(target=schedule_trade, daemon=True).start()
 
