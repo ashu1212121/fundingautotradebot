@@ -23,10 +23,11 @@ class PrecisionFuturesTrader:
         self.SYMBOL = 'HYPERUSDT'  # Trading pair
         self.FIXED_QTY = 1700      # Quantity (fixed at 1700 HYPER)
         self.LEVERAGE = 75         # Leverage fixed at 75x
-        self.ENTRY_TIME = (18, 29, 59, 0)  # 06:29:59.000 PM IST
+        self.ENTRY_TIME = (19, 29, 59, 150000)  # 07:29:59.150 PM IST (microseconds)
         self.time_offset = 0.0
         self.order_plan = []
         self.entry_time = None
+        self.liquidation_price = None
 
     async def _verify_connection(self, async_client):
         try:
@@ -64,13 +65,13 @@ class PrecisionFuturesTrader:
     def _get_server_time(self):
         return time.time() * 1000 + self.time_offset  # ms
 
-    def _calculate_target(self, hour, minute, second, millisecond):
+    def _calculate_target(self, hour, minute, second, microsecond):
         now = datetime.fromtimestamp(self._get_server_time() / 1000, IST)
         target = now.replace(
             hour=hour,
             minute=minute,
             second=second,
-            microsecond=millisecond * 1000
+            microsecond=microsecond
         )
         return target.timestamp() * 1000  # ms
 
@@ -81,6 +82,13 @@ class PrecisionFuturesTrader:
                 return
             remaining = target_ts - current
             await asyncio.sleep(max(remaining / 2000, 0.001))
+
+    async def _get_liquidation_price(self, async_client):
+        positions = await async_client.futures_position_information(symbol=self.SYMBOL)
+        for pos in positions:
+            if float(pos.get("positionAmt", 0)) > 0:
+                return float(pos.get("liquidationPrice", 0))
+        return None
 
     async def _execute_order(self, async_client, side, quantity=None):
         try:
@@ -118,17 +126,21 @@ class PrecisionFuturesTrader:
 
     async def _execute_sell_plan(self, async_client):
         try:
-            tasks = [
-                self._execute_order(async_client, 'SELL', quantity=qty)
-                for price, qty in self.order_plan
-            ]
-            await asyncio.gather(*tasks)
-            logging.info("Sell orders executed successfully.")
+            # Before selling, confirm position is still open (not liquidated)
+            positions = await async_client.futures_position_information(symbol=self.SYMBOL)
+            long_amt = next((float(p["positionAmt"]) for p in positions if float(p["positionAmt"]) > 0), 0)
+            if long_amt <= 0:
+                logging.warning("No open LONG position to close (possibly liquidated). Sell aborted.")
+                return
+            qty = min(self.FIXED_QTY, long_amt)
+            await self._execute_order(async_client, 'SELL', quantity=qty)
+            logging.info(f"Sell order executed for {qty} contracts of {self.SYMBOL} (closing long).")
         except Exception as e:
             logging.error(f"Failed to execute sell plan: {e}")
             raise
 
     async def _monitor_funding_fee_and_sell(self, async_client):
+        """Monitor funding fee, then attempt to close position if not liquidated."""
         try:
             while True:
                 income_history = await async_client.futures_income_history(
@@ -141,7 +153,13 @@ class PrecisionFuturesTrader:
                     if funding_time > self.entry_time:
                         logging.info("\n=== FUNDING FEE DETECTED ===")
                         logging.info(f"Funding fee credited: {income}")
-                        await self._execute_sell_plan(async_client)
+                        # Check for liquidation BEFORE selling
+                        positions = await async_client.futures_position_information(symbol=self.SYMBOL)
+                        long_amt = next((float(p["positionAmt"]) for p in positions if float(p["positionAmt"]) > 0), 0)
+                        if long_amt > 0:
+                            await self._execute_sell_plan(async_client)
+                        else:
+                            logging.warning("Position liquidated before exit. No new position will be opened.")
                         return
                 await asyncio.sleep(0.01)
         except Exception as e:
@@ -161,6 +179,12 @@ class PrecisionFuturesTrader:
             logging.info("\n=== ENTRY TRIGGERED ===")
             buy_order = await self._execute_order(async_client, 'BUY')
             self.entry_time = self._get_server_time()
+            # Fetch and log liquidation price after entry
+            self.liquidation_price = await self._get_liquidation_price(async_client)
+            if self.liquidation_price:
+                logging.info(f"Liquidation price after entry: {self.liquidation_price}")
+            else:
+                logging.warning("Could not fetch liquidation price after entry.")
             await self._fetch_order_book(async_client)
             await self._monitor_funding_fee_and_sell(async_client)
         except Exception as e:
