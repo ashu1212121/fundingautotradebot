@@ -1,409 +1,173 @@
-import sys
+from binance import AsyncClient
 import os
-import time
-import threading
-import traceback
-from datetime import datetime, timedelta, timezone
-import requests
-import re
 import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
+import time
 
-# --- Configure Logging ---
+# Configure logging with milliseconds
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
+    format='%(asctime)s,%(msecs)03d - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler('bot_debug.log'),
+        logging.StreamHandler()
+    ]
 )
-logger = logging.getLogger("TradeBot")
 
-# --- ENVIRONMENT VARIABLES ---
-try:
-    TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-    ALERT_ROOM_ID = int(os.environ["ALERT_ROOM_ID"])
-    LOG_ROOM_ID = int(os.environ["LOG_ROOM_ID"])
-    BINANCE_API_KEY = os.environ["BINANCE_API_KEY"]
-    BINANCE_API_SECRET = os.environ["BINANCE_API_SECRET"]
-    logger.info("Environment variables loaded successfully")
-    logger.info(
-        f"ENV: TELEGRAM_TOKEN: {TELEGRAM_TOKEN[:6]}..., ALERT_ROOM_ID: {ALERT_ROOM_ID}, LOG_ROOM_ID: {LOG_ROOM_ID}"
-    )
-except KeyError as e:
-    logger.error(f"❗ ENV ERROR: Missing environment variable: {e}")
-    sys.exit(1)
+IST = timezone(timedelta(hours=5, minutes=30))  # Indian Standard Time
 
-try:
-    from binance.client import Client
-    from binance.exceptions import BinanceAPIException
-    from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
-    logger.info("Dependencies imported successfully")
-except Exception as e:
-    logger.error(f"❗ PYTHON IMPORT ERROR: {e}")
-    traceback.print_exc()
-    sys.exit(1)
+class PrecisionFuturesTrader:
+    def __init__(self):
+        self.SYMBOL = 'HYPERUSDT'  # Trading pair
+        self.FIXED_QTY = 1700      # Quantity (fixed at 1700 HYPER)
+        self.LEVERAGE = 75         # Leverage fixed at 75x
+        self.ENTRY_TIME = (18, 29, 59, 0)  # 06:29:59.000 PM IST
+        self.time_offset = 0.0
+        self.order_plan = []
+        self.entry_time = None
 
-application = None
-
-# --- Binance Setup ---
-def preflight_binance_check():
-    logger.info("[STEP] Checking Binance API connectivity...")
-    client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
-    try:
-        client.futures_account_balance()
-        logger.info("[STEP] Binance API connectivity: OK")
-        return True
-    except BinanceAPIException as e:
-        logger.error(f"[Binance ERROR] {e}")
-        if hasattr(e, "code") and e.code == -2015:
-            try:
-                ip = requests.get("https://api.ipify.org").text.strip()
-                logger.error(f"[Binance ERROR] APIError -2015 (invalid API-key, IP, or permissions).")
-                logger.error(f"[Binance ERROR] Your current public IP is: {ip}")
-                logger.error(f"==> Go whitelist this IP on Binance, then restart the bot.")
-            except Exception as ip_e:
-                logger.error(f"[Binance ERROR] Could not fetch public IP: {ip_e}")
-            sys.exit(1)
-        else:
-            logger.error(f"[Binance ERROR] Unexpected Binance error: {e}")
-            sys.exit(1)
-    except Exception as e:
-        logger.error(f"[Binance ERROR] General error: {e}")
-        sys.exit(1)
-
-preflight_binance_check()
-binance = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
-
-# --- Telegram Utilities ---
-def send_telegram_message_sync(room_id, message):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {"chat_id": room_id, "text": message}
-        response = requests.post(url, json=payload)
-        if response.status_code == 200:
-            logger.info(f"Telegram message sent to room {room_id}")
-        else:
-            logger.error(f"Telegram API error: {response.status_code} - {response.text}")
-    except Exception as e:
-        logger.error(f"Telegram sync send error: {e}")
-
-async def say(room, message):
-    global application
-    try:
-        if application and hasattr(application, "bot"):
-            await application.bot.send_message(chat_id=room, text=message)
-        else:
-            logger.warning("Application not initialized, using sync send")
-            send_telegram_message_sync(room, message)
-    except Exception as e:
-        logger.error(f"Telegram async send error: {e}")
-        send_telegram_message_sync(room, f"⚠️ ASYNC FAILED: {message}")
-
-async def notify_error(where, error):
-    try:
-        await say(LOG_ROOM_ID, f"❗ Error in {where}: {type(error).__name__}: {error}")
-    except Exception as e:
-        logger.error(f"Error notification failed: {e}")
-        send_telegram_message_sync(LOG_ROOM_ID, f"🚨 CRITICAL: Error notification failed: {e}")
-
-# --- Heartbeat System ---
-def heartbeat():
-    try:
-        now = datetime.now(timezone.utc)
-        logger.info(f"[HEARTBEAT] Trade Bot is alive at {now.isoformat()}")
-        send_telegram_message_sync(LOG_ROOM_ID, f"❤️ HEARTBEAT: {now.strftime('%H:%M:%S UTC')}")
-    except Exception as e:
-        logger.error(f"Heartbeat failed: {e}")
-    finally:
-        threading.Timer(60, heartbeat).start()
-
-heartbeat()
-
-# --- Core Functions ---
-async def on_startup(app):
-    global application
-    application = app
-    logger.info("Application startup initiated")
-    await say(LOG_ROOM_ID, "🤖 Trade Bot started and ready!")
-
-    try:
-        ip = requests.get("https://api.ipify.org").text.strip()
-        logger.info(f"Public IP: {ip}")
-        await say(LOG_ROOM_ID, f"🌐 Public IP: {ip}")
-    except Exception as e:
-        logger.error(f"IP fetch error: {e}")
-
-def count_coins(coin, leverage):
-    try:
-        price = float(binance.futures_symbol_ticker(symbol=coin)['price'])
-        max_coins = (10 * leverage) / price
-        qty = int(max_coins * 0.75)
-        logger.info(f"[QTY] Price for {coin} = {price}, leverage = {leverage}, max_coins = {max_coins}, qty = {qty}")
-        return qty
-    except Exception as e:
-        logger.error(f"[QTY ERROR] Count coins error for {coin}: {e}")
-        return 0
-
-def is_still_good(coin):
-    try:
-        fr_data = binance.futures_premium_index(symbol=coin)
-        current_fr = float(fr_data['lastFundingRate'])
-        abs_fr = abs(current_fr) * 100
-        lev_data = binance.futures_leverage_bracket(symbol=coin)
-        leverage = lev_data[0]['brackets'][0]['initialLeverage']
-        value = abs_fr * leverage
-        logger.info(f"[FUNDING CHECK] {coin}: abs_fr={abs_fr:.4f}, leverage={leverage}, value={value:.4f}, current_fr={current_fr}")
-        return value > 100, value, current_fr
-    except Exception as e:
-        logger.error(f"[FUNDING CHECK ERROR] Funding check error for {coin}: {e}")
-        return False, 0, 0
-
-def read_alert(alert_text):
-    pat = (
-        r"ALERT:\s*(\w+)\s*[\r\n]+"
-        r"Funding Rate:\s*([-+]?\d*\.?\d+)%[\r\n]+"
-        r"Max Leverage:\s*(\d+)x[\r\n]+"
-        r"Next window:\s*([\d]{2}:[\d]{2}:[\d]{2})"
-    )
-    cleaned = re.sub(r'<.*?>', '', alert_text)
-    match = re.search(pat, cleaned, re.DOTALL | re.IGNORECASE)
-    if match:
-        coin = match.group(1)
-        fr = float(match.group(2))
-        leverage = int(match.group(3))
-        raw_time = match.group(4)
-        now = datetime.now(timezone.utc)
-        trade_time = datetime.strptime(raw_time, "%H:%M:%S").time()
-        full_time = datetime.combine(now.date(), trade_time).replace(tzinfo=timezone.utc)
-        if full_time < now:
-            full_time += timedelta(days=1)
-        return {
-            "coin": coin,
-            "fr": fr,
-            "leverage": leverage,
-            "time": full_time
-        }
-    return None
-
-# --- DIAGNOSIS DEBUG HANDLER ---
-async def debug_logger(update, context):
-    message_text = getattr(update.message, "text", None)
-    logger.info(f"DEBUG: Received message from chat id {getattr(update.message.chat, 'id', None)}: {message_text}")
-
-# --- Main Message Handler ---
-async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        raw_msg = update.message.text or ""
-        chat_id = update.message.chat.id
-        logger.info(f"[HANDLE] Received message from chat id {chat_id}: {raw_msg}")
-
-        await say(LOG_ROOM_ID, f"🛑 MIRROR FROM CHAT {chat_id}:\n{raw_msg}")
-
-        cleaned = raw_msg.lower()
-        logger.info(f"[HANDLE] Cleaned message: '{cleaned}'")
-
-        if chat_id != ALERT_ROOM_ID:
-            logger.warning(f"[HANDLE] Received message from unexpected chat: {chat_id}")
-            await say(LOG_ROOM_ID,
-                f"⚠️ Received message from unknown chat: {chat_id}\n"
-                f"Expected: {ALERT_ROOM_ID}"
-            )
-            return
-
-        cleaned_content = cleaned.replace("@autofundingtradebot", "").strip()
-        logger.info(f"[HANDLE] Content after removing mention: '{cleaned_content}'")
-
-        if "no lead found" in cleaned_content:
-            logger.info("[HANDLE] No lead pattern detected")
-            response = (
-                f"🔄 No trade planned.\n"
-                f"Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}\n"
-                f"Triggered by: {raw_msg[:100]}..."
-            )
-            await say(LOG_ROOM_ID, response)
-            return
-
-        if "alert:" in cleaned:
-            logger.info("[HANDLE] Alert pattern detected")
-            alert_data = read_alert(raw_msg)
-            if not alert_data:
-                logger.warning("[HANDLE] Alert parsing failed")
-                await say(LOG_ROOM_ID,
-                    f"❗ ALERT PARSE FAILURE: Could not parse trade signal.\n"
-                    f"Message: {raw_msg[:200]}..."
-                )
-                return
-
-            logger.info(f"[HANDLE] Alert parsed OK: {alert_data}")
-            coin = alert_data["coin"]
-            leverage = alert_data["leverage"]
-            funding_time = alert_data["time"]
-            now = datetime.now(timezone.utc)
-
-            qty = count_coins(coin, leverage)
-            logger.info(f"[ALERT] QTY calculated for {coin} at {leverage}x: {qty}")
-            await say(LOG_ROOM_ID, f"ℹ️ QTY calculated for {coin} at {leverage}x: {qty}")
-
-            if qty == 0:
-                logger.error(f"[ALERT ERROR] Coin count failed for {coin}")
-                await say(LOG_ROOM_ID, f"❌ Trade failed: Could not count coins for {coin}.")
-                return
-
-            try:
-                binance.futures_change_leverage(symbol=coin, leverage=leverage)
-                fr_data = binance.futures_premium_index(symbol=coin)
-                current_fr = float(fr_data['lastFundingRate'])
-                direction = "SELL" if current_fr > 0 else "BUY"
-                logger.info(f"[ALERT] Direction determined: {direction} (Funding Rate: {current_fr})")
-            except Exception as e:
-                logger.error(f"[ALERT ERROR] Pre-trade checks failed: {e}")
-                await notify_error("handle_message (pre-checks)", e)
-                return
-
-            entry_time = funding_time - timedelta(seconds=1)
-            check_time = entry_time - timedelta(minutes=5)
-            time_remaining = (entry_time - now).total_seconds()
-
-            if time_remaining <= 0:
-                logger.warning("[ALERT ERROR] Entry time already passed")
-                await say(LOG_ROOM_ID, "⚠️ Entry time already passed. Trade cancelled.")
-                return
-
-            await say(
-                LOG_ROOM_ID,
-                f"🔔 New trade planned: {coin}\n"
-                f"Direction: {direction}\n"
-                f"Qty: {qty}\n"
-                f"Entry at {entry_time.strftime('%H:%M:%S')} UTC\n"
-                f"⏳ Time remaining: {timedelta(seconds=int(time_remaining))}"
-            )
-            logger.info(f"[SCHEDULE] Trade for {coin} {direction} qty={qty} will be checked at {check_time.strftime('%H:%M:%S')} UTC and executed at {entry_time.strftime('%H:%M:%S')} UTC")
-
-            def schedule_trade():
-                try:
-                    logger.info(f"[SCHEDULE] Scheduler thread started for {coin} - will sleep until check_time: {check_time}")
-                    time.sleep(max(0, (check_time - datetime.now(timezone.utc)).total_seconds()))
-                    logger.info(f"[SCHEDULE] Woke up for funding check at: {datetime.now(timezone.utc)}")
-                    good, value, current_fr2 = is_still_good(coin)
-                    logger.info(f"[SCHEDULE] Funding check at {datetime.now(timezone.utc)}: good={good}, value={value}, fr={current_fr2}")
-                    if not good:
-                        msg = (
-                            f"❌ Trade cancelled: Funding not good enough for {coin}\n"
-                            f"Current value: {value:.2f} (need >100)"
-                        )
-                        asyncio.run(say(LOG_ROOM_ID, msg))
-                        logger.info(f"[SCHEDULE] Trade for {coin} cancelled due to funding check.")
-                        return
-                    logger.info(f"[SCHEDULE] Funding is good. Sleeping until entry_time: {entry_time}")
-                    time.sleep(max(0, (entry_time - datetime.now(timezone.utc)).total_seconds()))
-                    logger.info(f"[SCHEDULE] Time to execute trade for {coin} at {datetime.now(timezone.utc)}")
-                    asyncio.run(execute_trade(coin, qty, direction, funding_time))
-                except Exception as e:
-                    logger.error(f"[SCHEDULE ERROR] Trade scheduling failed for {coin}: {e}\n{traceback.format_exc()}")
-                    try:
-                        asyncio.run(notify_error("schedule_trade", e))
-                    except Exception as notify_exc:
-                        logger.error(f"[SCHEDULE ERROR] notify_error failed: {notify_exc}")
-
-            threading.Thread(target=schedule_trade, daemon=True).start()
-
-        else:
-            logger.info("[HANDLE] No alert pattern detected")
-            await say(LOG_ROOM_ID, f"ℹ️ Received non-alert message:\n{raw_msg[:100]}...")
-
-    except Exception as e:
-        logger.error(f"[HANDLE ERROR] Message handling crashed: {e}\n{traceback.format_exc()}")
-        await notify_error("handle_message", e)
-
-async def execute_trade(coin, qty, direction, funding_time):
-    try:
-        logger.info(f"[TRADE EXEC] Executing trade: {coin} {direction} {qty}")
-        await say(LOG_ROOM_ID, f"⏳ Executing {direction} order for {qty} {coin}...")
-
-        entry_order = binance.futures_create_order(
-            symbol=coin,
-            side=direction,
-            type="MARKET",
-            quantity=qty
-        )
-        entry_time = datetime.now(timezone.utc)
-        logger.info(f"[TRADE EXEC] {coin} {direction} order placed at {entry_time.strftime('%H:%M:%S')} UTC, Binance response: {entry_order}")
-        await say(LOG_ROOM_ID, f"🚀 {coin} {direction} order placed at {entry_time.strftime('%H:%M:%S')} UTC")
-
-        found_fee = False
-        money_bag = 0.0
-        funding_ts_ms = int(funding_time.timestamp() * 1000)
-
-        await say(LOG_ROOM_ID, "⏳ Waiting for funding fee...")
-        for _ in range(30):  # 30 attempts with 1s delay = 30s total
-            try:
-                history = binance.futures_income_history(
-                    symbol=coin,
-                    incomeType="FUNDING_FEE",
-                    limit=1
-                )
-                logger.info(f"[FUNDING FEE] Income history: {history}")
-                if history and int(history[0]['time']) >= funding_ts_ms:
-                    found_fee = True
-                    money_bag = float(history[0]['income'])
-                    break
-            except Exception as e:
-                logger.warning(f"[FUNDING FEE ERROR] Funding fee check failed: {e}")
-            time.sleep(1)
-
-        close_side = "BUY" if direction == "SELL" else "SELL"
+    async def _verify_connection(self, async_client):
         try:
-            close_order = binance.futures_create_order(
-                symbol=coin,
-                side=close_side,
-                type="MARKET",
-                quantity=qty,
-                reduceOnly=True
-            )
-            logger.info(f"[TRADE EXEC] {coin} position closed, Binance response: {close_order}")
-            await say(LOG_ROOM_ID, f"✅ {coin} position closed")
+            account_info = await async_client.futures_account()
+            if not account_info['canTrade']:
+                raise PermissionError("Futures trading disabled")
+            logging.info("API connection verified")
         except Exception as e:
-            logger.error(f"[TRADE EXEC ERROR] Error closing position for {coin}: {e}")
-            await notify_error("execute_trade (close position)", e)
+            logging.error(f"Connection failed: {e}")
+            raise
 
-        if found_fee:
-            await say(LOG_ROOM_ID, f"💰 Funding fee received: {money_bag:.6f} USDT")
-        else:
-            await say(LOG_ROOM_ID, f"⚠️ Funding fee not detected within 30s")
+    async def _calibrate_time_sync(self, async_client):
+        measurements = []
+        for _ in range(20):
+            try:
+                t0 = time.time() * 1000
+                server_time = (await async_client.futures_time())['serverTime']
+                t1 = time.time() * 1000
+                latency = t1 - t0
+                offset = server_time - ((t0 + t1) / 2)
+                measurements.append((latency, offset))
+            except Exception as e:
+                logging.warning(f"Time sync failed: {e}")
+        avg_latency = sum(m[0] for m in measurements) / len(measurements) if measurements else 0
+        self.time_offset = sum(m[1] for m in measurements) / len(measurements) if measurements else 0
+        logging.info(f"Time synced | Offset: {self.time_offset:.2f}ms | Latency: {avg_latency:.2f}ms")
 
-    except Exception as e:
-        logger.error(f"[TRADE EXEC ERROR] Exception in execute_trade: {e}\n{traceback.format_exc()}")
-        await notify_error("execute_trade", e)
-
-def main():
-    logger.info("Starting main application")
-    try:
-        app = (
-            ApplicationBuilder()
-            .token(TELEGRAM_TOKEN)
-            .post_init(on_startup)
-            .build()
+    async def _set_leverage(self, async_client):
+        await async_client.futures_change_leverage(
+            symbol=self.SYMBOL,
+            leverage=self.LEVERAGE
         )
+        logging.info(f"Leverage set to {self.LEVERAGE}x for {self.SYMBOL}")
 
-        # Debug handler: logs every single incoming message to Railway log
-        app.add_handler(MessageHandler(filters.ALL, debug_logger))
+    def _get_server_time(self):
+        return time.time() * 1000 + self.time_offset  # ms
 
-        # Main handler: only reacts to text messages (from any chat)
-        app.add_handler(
-            MessageHandler(
-                filters.TEXT,
-                handle_message
+    def _calculate_target(self, hour, minute, second, millisecond):
+        now = datetime.fromtimestamp(self._get_server_time() / 1000, IST)
+        target = now.replace(
+            hour=hour,
+            minute=minute,
+            second=second,
+            microsecond=millisecond * 1000
+        )
+        return target.timestamp() * 1000  # ms
+
+    async def _precision_wait(self, target_ts):
+        while True:
+            current = self._get_server_time()
+            if current >= target_ts:
+                return
+            remaining = target_ts - current
+            await asyncio.sleep(max(remaining / 2000, 0.001))
+
+    async def _execute_order(self, async_client, side, quantity=None):
+        try:
+            qty = quantity if quantity else self.FIXED_QTY
+            order = await async_client.futures_create_order(
+                symbol=self.SYMBOL,
+                side=side,
+                type='MARKET',
+                quantity=qty,
+                newOrderRespType='FULL'
             )
+            logging.info(f"Market {side} order executed for {qty} {self.SYMBOL}: {order}")
+            return order
+        except Exception as e:
+            logging.error(f"Failed to execute market {side} order: {e}")
+            raise
+
+    async def _fetch_order_book(self, async_client):
+        try:
+            order_book = await async_client.futures_order_book(symbol=self.SYMBOL, limit=50)
+            bids = order_book['bids']
+            remaining_qty = self.FIXED_QTY
+            self.order_plan = []
+            for price, qty in bids:
+                qty = float(qty)
+                if remaining_qty <= 0:
+                    break
+                chunk_qty = min(remaining_qty, qty)
+                self.order_plan.append((float(price), chunk_qty))
+                remaining_qty -= chunk_qty
+            logging.info(f"Sell order plan created: {self.order_plan}")
+        except Exception as e:
+            logging.error(f"Failed to fetch order book: {e}")
+            raise
+
+    async def _execute_sell_plan(self, async_client):
+        try:
+            tasks = [
+                self._execute_order(async_client, 'SELL', quantity=qty)
+                for price, qty in self.order_plan
+            ]
+            await asyncio.gather(*tasks)
+            logging.info("Sell orders executed successfully.")
+        except Exception as e:
+            logging.error(f"Failed to execute sell plan: {e}")
+            raise
+
+    async def _monitor_funding_fee_and_sell(self, async_client):
+        try:
+            while True:
+                income_history = await async_client.futures_income_history(
+                    symbol=self.SYMBOL,
+                    incomeType='FUNDING_FEE',
+                    limit=10
+                )
+                for income in income_history:
+                    funding_time = income['time']
+                    if funding_time > self.entry_time:
+                        logging.info("\n=== FUNDING FEE DETECTED ===")
+                        logging.info(f"Funding fee credited: {income}")
+                        await self._execute_sell_plan(async_client)
+                        return
+                await asyncio.sleep(0.01)
+        except Exception as e:
+            logging.error(f"Error while monitoring funding fee: {e}")
+            raise
+
+    async def execute_strategy(self):
+        async_client = await AsyncClient.create(
+            os.getenv('BINANCE_API_KEY'), os.getenv('BINANCE_API_SECRET')
         )
-
-        logger.info(f"Handler registered for chat ID: {ALERT_ROOM_ID}")
-        logger.info("Starting polling...")
-        app.run_polling()
-
-    except Exception as e:
-        logger.critical(f"Fatal error: {e}\n{traceback.format_exc()}")
-        send_telegram_message_sync(LOG_ROOM_ID, f"🆘 BOT CRASHED: {e}")
-        sys.exit(1)
+        try:
+            await self._verify_connection(async_client)
+            await self._set_leverage(async_client)
+            await self._calibrate_time_sync(async_client)
+            entry_target = self._calculate_target(*self.ENTRY_TIME)
+            await self._precision_wait(entry_target)
+            logging.info("\n=== ENTRY TRIGGERED ===")
+            buy_order = await self._execute_order(async_client, 'BUY')
+            self.entry_time = self._get_server_time()
+            await self._fetch_order_book(async_client)
+            await self._monitor_funding_fee_and_sell(async_client)
+        except Exception as e:
+            logging.error(f"Strategy failed: {e}")
+        finally:
+            await async_client.close_connection()
 
 if __name__ == "__main__":
-    logger.info("Launching application")
-    main()
+    trader = PrecisionFuturesTrader()
+    asyncio.run(trader.execute_strategy())
