@@ -23,7 +23,8 @@ class PrecisionFuturesTrader:
         self.SYMBOL = 'HYPERUSDT'  # Trading pair
         self.FIXED_QTY = 1500      # Quantity (fixed at 1500 HYPER)
         self.LEVERAGE = 75         # Leverage fixed at 75x
-        self.ENTRY_TIME = (19, 29, 59, 150000)  # 07:29:59.150 PM IST (microseconds)
+        # 08:29:59.200 PM IST (20:29:59.200)
+        self.ENTRY_TIME = (20, 29, 59, 200000)  
         self.time_offset = 0.0
         self.entry_time = None
         self.liquidation_price = None
@@ -54,7 +55,20 @@ class PrecisionFuturesTrader:
         self.time_offset = sum(m[1] for m in measurements) / len(measurements) if measurements else 0
         logging.info(f"Time synced | Offset: {self.time_offset:.2f}ms | Latency: {avg_latency:.2f}ms")
 
-    async def _set_leverage(self, async_client):
+    async def _set_leverage_and_margin_type(self, async_client):
+        # Set isolated margin type
+        try:
+            await async_client.futures_change_margin_type(
+                symbol=self.SYMBOL,
+                marginType='ISOLATED'
+            )
+            logging.info(f"Margin type set to ISOLATED for {self.SYMBOL}")
+        except Exception as e:
+            if "No need to change margin type" not in str(e):
+                logging.warning(f"Could not set margin type: {e}")
+            else:
+                logging.info(f"Margin type already ISOLATED for {self.SYMBOL}")
+        # Set leverage
         await async_client.futures_change_leverage(
             symbol=self.SYMBOL,
             leverage=self.LEVERAGE
@@ -97,7 +111,7 @@ class PrecisionFuturesTrader:
                 return amt
         return 0
 
-    async def _execute_order(self, async_client, side, quantity=None):
+    async def _execute_order(self, async_client, side, quantity=None, reduce_only=False):
         try:
             qty = quantity if quantity else self.FIXED_QTY
             order = await async_client.futures_create_order(
@@ -105,6 +119,7 @@ class PrecisionFuturesTrader:
                 side=side,
                 type='MARKET',
                 quantity=qty,
+                reduceOnly=reduce_only,  # Important for safety!
                 newOrderRespType='FULL'
             )
             logging.info(f"Market {side} order executed for {qty} {self.SYMBOL}: {order}")
@@ -114,7 +129,7 @@ class PrecisionFuturesTrader:
             raise
 
     async def _monitor_funding_fee_and_sell(self, async_client):
-        """Monitor funding fee, then attempt to close position if not liquidated."""
+        """Monitor funding fee, then attempt to close position without risk of opening a short."""
         try:
             while True:
                 income_history = await async_client.futures_income_history(
@@ -127,14 +142,16 @@ class PrecisionFuturesTrader:
                     if funding_time > self.entry_time:
                         logging.info("\n=== FUNDING FEE DETECTED ===")
                         logging.info(f"Funding fee credited: {income}")
-                        # Check for liquidation BEFORE selling
-                        long_amt = await self._get_long_position_amt(async_client)
-                        if long_amt > 0:
-                            qty = min(self.FIXED_QTY, long_amt)
-                            await self._execute_order(async_client, 'SELL', quantity=qty)
-                            logging.info(f"Sell order executed for {qty} contracts of {self.SYMBOL} (closing long).")
-                        else:
-                            logging.warning("Position liquidated before exit. No new position will be opened.")
+                        # Place reduceOnly sell order immediately (no pre-check)
+                        try:
+                            await self._execute_order(
+                                async_client, 'SELL',
+                                quantity=self.FIXED_QTY,
+                                reduce_only=True
+                            )
+                            logging.info(f"ReduceOnly Sell order executed for {self.FIXED_QTY} contracts of {self.SYMBOL} (attempt to close long).")
+                        except Exception as sell_exc:
+                            logging.warning(f"ReduceOnly Sell order failed (likely liquidated): {sell_exc}")
                         return
                 await asyncio.sleep(0.01)
         except Exception as e:
@@ -147,7 +164,7 @@ class PrecisionFuturesTrader:
         )
         try:
             await self._verify_connection(async_client)
-            await self._set_leverage(async_client)
+            await self._set_leverage_and_margin_type(async_client)
             await self._calibrate_time_sync(async_client)
             entry_target = self._calculate_target(*self.ENTRY_TIME)
             await self._precision_wait(entry_target)
