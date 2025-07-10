@@ -53,10 +53,10 @@ async def async_futures_transfer(api_key, api_secret, asset, amount, type_):
 class PrecisionFuturesTrader:
     def __init__(self):
         self.SYMBOL = 'HYPERUSDT'  # Trading pair
-        self.FIXED_QTY = 1250      # Quantity (fixed at 1050 HYPER)
+        self.FIXED_QTY = 1250      # Quantity (fixed at 1250 HYPER)
         self.LEVERAGE = 75         # Leverage fixed at 75x
-        # 11:29:59.200 PM IST (23:29:59.200)
-        self.ENTRY_TIME = (23, 29, 59, 200000)  
+        # 12:29:59.200 AM IST (00:29:59.200)
+        self.ENTRY_TIME = (0, 29, 59, 200000)  
         self.time_offset = 0.0
         self.entry_time = None
         self.liquidation_price = None
@@ -166,10 +166,10 @@ class PrecisionFuturesTrader:
 
     async def _transfer_funding_fee(self, api_key, api_secret, funding_income):
         try:
-            # Only attempt transfer if funding_income > 1
             income_amount = float(funding_income)
             if income_amount > 1:
-                transfer_amount = round(income_amount - 1, 8)  # up to 8 decimals for USDT
+                # Transfer 70% of funding fee, rounded to 2 decimals
+                transfer_amount = round(income_amount * 0.70, 2)
                 # type=2 means transfer from USDT-M Futures to Spot
                 transfer_result = await async_futures_transfer(
                     api_key, api_secret, 'USDT', transfer_amount, 2
