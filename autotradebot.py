@@ -23,8 +23,8 @@ class PrecisionFuturesTrader:
         self.SYMBOL = 'HYPERUSDT'  # Trading pair
         self.FIXED_QTY = 1050      # Quantity (fixed at 1050 HYPER)
         self.LEVERAGE = 75         # Leverage fixed at 75x
-        # 09:29:59.200 PM IST (21:29:59.200)
-        self.ENTRY_TIME = (21, 29, 59, 200000)  
+        # 10:29:59.200 PM IST (22:29:59.200)
+        self.ENTRY_TIME = (22, 29, 59, 200000)  
         self.time_offset = 0.0
         self.entry_time = None
         self.liquidation_price = None
@@ -56,18 +56,18 @@ class PrecisionFuturesTrader:
         logging.info(f"Time synced | Offset: {self.time_offset:.2f}ms | Latency: {avg_latency:.2f}ms")
 
     async def _set_leverage_and_margin_type(self, async_client):
-        # Set isolated margin type
+        # Set cross margin type
         try:
             await async_client.futures_change_margin_type(
                 symbol=self.SYMBOL,
-                marginType='ISOLATED'
+                marginType='CROSSED'
             )
-            logging.info(f"Margin type set to ISOLATED for {self.SYMBOL}")
+            logging.info(f"Margin type set to CROSSED for {self.SYMBOL}")
         except Exception as e:
             if "No need to change margin type" not in str(e):
                 logging.warning(f"Could not set margin type: {e}")
             else:
-                logging.info(f"Margin type already ISOLATED for {self.SYMBOL}")
+                logging.info(f"Margin type already CROSSED for {self.SYMBOL}")
         # Set leverage
         await async_client.futures_change_leverage(
             symbol=self.SYMBOL,
@@ -128,8 +128,26 @@ class PrecisionFuturesTrader:
             logging.error(f"Failed to execute market {side} order: {e}")
             raise
 
+    async def _transfer_funding_fee(self, async_client, funding_income):
+        try:
+            # Only attempt transfer if funding_income > 1
+            income_amount = float(funding_income)
+            if income_amount > 1:
+                transfer_amount = round(income_amount - 1, 8)  # up to 8 decimals for USDT
+                # type=2 means transfer from USDT-M Futures to Spot
+                transfer_result = await async_client.futures_transfer(
+                    asset='USDT',
+                    amount=transfer_amount,
+                    type=2
+                )
+                logging.info(f"Transferred {transfer_amount} USDT from Futures to Spot: {transfer_result}")
+            else:
+                logging.info("Funding fee <= 1 USDT, skipping transfer.")
+        except Exception as e:
+            logging.error(f"Failed to transfer funding fee to spot: {e}")
+
     async def _monitor_funding_fee_and_sell(self, async_client):
-        """Monitor funding fee, then attempt to close position without risk of opening a short."""
+        """Monitor funding fee, then attempt to transfer funding fee and close position without risk of opening a short."""
         try:
             while True:
                 income_history = await async_client.futures_income_history(
@@ -142,16 +160,24 @@ class PrecisionFuturesTrader:
                     if funding_time > self.entry_time:
                         logging.info("\n=== FUNDING FEE DETECTED ===")
                         logging.info(f"Funding fee credited: {income}")
-                        # Place reduceOnly sell order immediately (no pre-check)
-                        try:
-                            await self._execute_order(
+                        # Start transfer and exit concurrently
+                        funding_income = income.get('income', '0')
+                        transfer_task = asyncio.create_task(
+                            self._transfer_funding_fee(async_client, funding_income)
+                        )
+                        sell_task = asyncio.create_task(
+                            self._execute_order(
                                 async_client, 'SELL',
                                 quantity=self.FIXED_QTY,
                                 reduce_only=True
                             )
-                            logging.info(f"ReduceOnly Sell order executed for {self.FIXED_QTY} contracts of {self.SYMBOL} (attempt to close long).")
-                        except Exception as sell_exc:
-                            logging.warning(f"ReduceOnly Sell order failed (likely liquidated): {sell_exc}")
+                        )
+                        # Wait for both tasks to finish, but do not delay sell for transfer
+                        done, pending = await asyncio.wait(
+                            [transfer_task, sell_task],
+                            return_when=asyncio.ALL_COMPLETED
+                        )
+                        logging.info(f"ReduceOnly Sell order executed for {self.FIXED_QTY} contracts of {self.SYMBOL} (attempt to close long).")
                         return
                 await asyncio.sleep(0.01)
         except Exception as e:
