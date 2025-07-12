@@ -78,7 +78,22 @@ class KNCUSDTTrader:
                 newOrderRespType='FULL'
             )
             logging.info(f"Market BUY order executed for {qty} {self.SYMBOL}: {order}")
-            fill_price = float(order['avgFillPrice']) if 'avgFillPrice' in order and order['avgFillPrice'] else float(order['fills'][0]['price'])
+            # FIX: Do not use fills, use avgFillPrice or position info
+            fill_price = None
+            if 'avgFillPrice' in order and order['avgFillPrice'] and float(order['avgFillPrice']) > 0:
+                fill_price = float(order['avgFillPrice'])
+            elif 'avgPrice' in order and order['avgPrice'] and float(order['avgPrice']) > 0:
+                fill_price = float(order['avgPrice'])
+            else:
+                # Fallback: fetch position info
+                position = await async_client.futures_position_information(symbol=self.SYMBOL)
+                for pos in position:
+                    # Find long position (positive positionAmt)
+                    if pos['symbol'] == self.SYMBOL and float(pos['positionAmt']) > 0:
+                        fill_price = float(pos['entryPrice'])
+                        break
+            if fill_price is None:
+                raise Exception("Could not determine fill price for KNCUSDT")
             return order['orderId'], fill_price
         except Exception as e:
             logging.error(f"Failed to execute market BUY order: {e}")
@@ -91,7 +106,6 @@ class KNCUSDTTrader:
                 for f in symbol_data['filters']:
                     if f['filterType'] == 'PRICE_FILTER':
                         tick_size = float(f['tickSize'])
-                        # Count decimals in tick_size
                         decimals = max(0, len(str(tick_size).split('.')[-1].rstrip('0')))
                         return decimals
         return 3  # fallback
