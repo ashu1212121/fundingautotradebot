@@ -22,8 +22,8 @@ class KNCUSDTTrader:
     def __init__(self):
         self.SYMBOL = 'KNCUSDT'         # Trading pair
         self.LEVERAGE = 50              # 50x leverage
-        self.MARGIN_USDT = 5            # 5 USDT margin
-        self.TRADE_DELAY_SEC = 2 * 60   # Trade after 2 mins
+        self.MARGIN_USDT = 5.0          # Use up to 5 USDT margin
+        self.TRADE_DELAY_SEC = 30       # Wait 30 seconds before trading
         self.PROFIT_PCT = 0.0026        # 0.26%
         self.SELL_TIMEOUT = 120         # seconds to wait for sell fill
 
@@ -61,11 +61,12 @@ class KNCUSDTTrader:
 
     async def _precompute_qty(self, async_client):
         market_price = await self._get_market_price(async_client)
+        # Use 95% of the calculated qty for 5 USDT margin
         qty = (self.MARGIN_USDT * self.LEVERAGE) / market_price
-        precomputed_qty = int(qty)   # round down to nearest integer
+        precomputed_qty = int(qty * 0.95)   # 95%, round down to integer
         if precomputed_qty < 1:
             precomputed_qty = 1
-        logging.info(f"Precomputed qty for {self.SYMBOL} at price {market_price}: {precomputed_qty}")
+        logging.info(f"Precomputed qty for {self.SYMBOL} at price {market_price}: {precomputed_qty} (using max $5 margin, 95% qty, 50x)")
         return precomputed_qty, market_price
 
     async def _open_long(self, async_client, qty):
