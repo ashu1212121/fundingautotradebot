@@ -1,7 +1,7 @@
 import os
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta, timezone
 import time
 from binance import AsyncClient
 
@@ -23,9 +23,9 @@ class KNCUSDTTrader:
         self.SYMBOL = 'KNCUSDT'         # Trading pair
         self.LEVERAGE = 50              # 50x leverage
         self.MARGIN_USDT = 5            # 5 USDT margin
-        self.TRADE_DELAY_SEC = 4 * 60   # Trade after 4 mins
+        self.TRADE_DELAY_SEC = 2 * 60   # Trade after 2 mins
         self.PROFIT_PCT = 0.0026        # 0.26%
-        self.SELL_TIMEOUT = 18          # seconds to wait for sell fill
+        self.SELL_TIMEOUT = 120         # seconds to wait for sell fill
 
     async def _verify_connection(self, async_client):
         try:
@@ -59,18 +59,6 @@ class KNCUSDTTrader:
         ticker = await async_client.futures_mark_price(symbol=self.SYMBOL)
         return float(ticker['markPrice'])
 
-    async def _get_price_decimals(self, async_client):
-        exchange_info = await async_client.futures_exchange_info()
-        for symbol_data in exchange_info['symbols']:
-            if symbol_data['symbol'] == self.SYMBOL:
-                step_size = None
-                for f in symbol_data['filters']:
-                    if f['filterType'] == 'PRICE_FILTER':
-                        tick_size = float(f['tickSize'])
-                        decimals = abs(decimal.Decimal(str(tick_size)).as_tuple().exponent)
-                        return decimals
-        return 2  # fallback
-
     async def _precompute_qty(self, async_client):
         market_price = await self._get_market_price(async_client)
         qty = (self.MARGIN_USDT * self.LEVERAGE) / market_price
@@ -90,11 +78,23 @@ class KNCUSDTTrader:
                 newOrderRespType='FULL'
             )
             logging.info(f"Market BUY order executed for {qty} {self.SYMBOL}: {order}")
-            fill_price = float(order['avgFillPrice']) if 'avgFillPrice' in order else float(order['fills'][0]['price'])
+            fill_price = float(order['avgFillPrice']) if 'avgFillPrice' in order and order['avgFillPrice'] else float(order['fills'][0]['price'])
             return order['orderId'], fill_price
         except Exception as e:
             logging.error(f"Failed to execute market BUY order: {e}")
             raise
+
+    async def _get_price_decimals(self, async_client):
+        exchange_info = await async_client.futures_exchange_info()
+        for symbol_data in exchange_info['symbols']:
+            if symbol_data['symbol'] == self.SYMBOL:
+                for f in symbol_data['filters']:
+                    if f['filterType'] == 'PRICE_FILTER':
+                        tick_size = float(f['tickSize'])
+                        # Count decimals in tick_size
+                        decimals = max(0, len(str(tick_size).split('.')[-1].rstrip('0')))
+                        return decimals
+        return 3  # fallback
 
     async def _place_sell_limit(self, async_client, qty, price, price_decimals):
         price = round(price, price_decimals)
@@ -156,7 +156,7 @@ class KNCUSDTTrader:
             await asyncio.sleep(self.TRADE_DELAY_SEC)
 
             qty, entry_price = await self._precompute_qty(async_client)
-            price_decimals = 3  # Default, you can fetch dynamically with _get_price_decimals if needed
+            price_decimals = await self._get_price_decimals(async_client)
 
             buy_order_id, real_entry_price = await self._open_long(async_client, qty)
 
