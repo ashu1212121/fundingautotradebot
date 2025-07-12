@@ -3,11 +3,6 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 import time
-import aiohttp
-import hmac
-import hashlib
-import urllib.parse
-
 from binance import AsyncClient
 
 # Configure logging with milliseconds
@@ -23,41 +18,14 @@ logging.basicConfig(
 
 IST = timezone(timedelta(hours=5, minutes=30))  # Indian Standard Time
 
-async def async_futures_transfer(api_key, api_secret, asset, amount, type_):
-    """
-    Custom async function to transfer from Futures to Spot using Binance REST API.
-    """
-    base_url = "https://api.binance.com"
-    endpoint = "/sapi/v1/futures/transfer"
-    timestamp = int(time.time() * 1000)
-    params = {
-        "asset": asset,
-        "amount": amount,
-        "type": type_,
-        "timestamp": timestamp
-    }
-    query_string = urllib.parse.urlencode(params)
-    signature = hmac.new(
-        api_secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256
-    ).hexdigest()
-    headers = {"X-MBX-APIKEY": api_key}
-    url = f"{base_url}{endpoint}?{query_string}&signature={signature}"
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers) as resp:
-            data = await resp.json()
-            if resp.status != 200:
-                raise Exception(f"Binance transfer failed: {data}")
-            return data
-
-class PrecisionFuturesTrader:
+class KNCUSDTTrader:
     def __init__(self):
-        self.SYMBOL = 'HYPERUSDT'  # Trading pair
-        self.LEVERAGE = 75         # Leverage fixed at 75x
-        self.ENTRY_TIME = (1, 29, 59, 250000)  # 01:29:59:250 AM IST
-        self.time_offset = 0.0
-        self.entry_time = None
-        self.precomputed_qty = None
+        self.SYMBOL = 'KNCUSDT'         # Trading pair
+        self.LEVERAGE = 50              # 50x leverage
+        self.MARGIN_USDT = 5            # 5 USDT margin
+        self.TRADE_DELAY_SEC = 4 * 60   # Trade after 4 mins
+        self.PROFIT_PCT = 0.0026        # 0.26%
+        self.SELL_TIMEOUT = 18          # seconds to wait for sell fill
 
     async def _verify_connection(self, async_client):
         try:
@@ -69,24 +37,7 @@ class PrecisionFuturesTrader:
             logging.error(f"Connection failed: {e}")
             raise
 
-    async def _calibrate_time_sync(self, async_client):
-        measurements = []
-        for _ in range(20):
-            try:
-                t0 = time.time() * 1000
-                server_time = (await async_client.futures_time())['serverTime']
-                t1 = time.time() * 1000
-                latency = t1 - t0
-                offset = server_time - ((t0 + t1) / 2)
-                measurements.append((latency, offset))
-            except Exception as e:
-                logging.warning(f"Time sync failed: {e}")
-        avg_latency = sum(m[0] for m in measurements) / len(measurements) if measurements else 0
-        self.time_offset = sum(m[1] for m in measurements) / len(measurements) if measurements else 0
-        logging.info(f"Time synced | Offset: {self.time_offset:.2f}ms | Latency: {avg_latency:.2f}ms")
-
     async def _set_leverage_and_margin_type(self, async_client):
-        # Set cross margin type
         try:
             await async_client.futures_change_margin_type(
                 symbol=self.SYMBOL,
@@ -98,146 +49,138 @@ class PrecisionFuturesTrader:
                 logging.warning(f"Could not set margin type: {e}")
             else:
                 logging.info(f"Margin type already CROSSED for {self.SYMBOL}")
-        # Set leverage
         await async_client.futures_change_leverage(
             symbol=self.SYMBOL,
             leverage=self.LEVERAGE
         )
         logging.info(f"Leverage set to {self.LEVERAGE}x for {self.SYMBOL}")
 
-    def _get_server_time(self):
-        return time.time() * 1000 + self.time_offset  # ms
-
-    def _calculate_target(self, hour, minute, second, microsecond):
-        now = datetime.fromtimestamp(self._get_server_time() / 1000, IST)
-        target = now.replace(
-            hour=hour,
-            minute=minute,
-            second=second,
-            microsecond=microsecond
-        )
-        if target < now:
-            target += timedelta(days=1)
-        return target.timestamp() * 1000  # ms
-
-    async def _precision_wait(self, target_ts):
-        while True:
-            current = self._get_server_time()
-            if current >= target_ts:
-                return
-            remaining = target_ts - current
-            await asyncio.sleep(max(remaining / 2000, 0.001))
-
     async def _get_market_price(self, async_client):
         ticker = await async_client.futures_mark_price(symbol=self.SYMBOL)
         return float(ticker['markPrice'])
 
-    async def _precompute_qty(self, async_client, margin_usd=5.5):
-        """Calculate 95% of the qty using price 2 seconds before entry, rounded to 0 decimals."""
+    async def _get_price_decimals(self, async_client):
+        exchange_info = await async_client.futures_exchange_info()
+        for symbol_data in exchange_info['symbols']:
+            if symbol_data['symbol'] == self.SYMBOL:
+                step_size = None
+                for f in symbol_data['filters']:
+                    if f['filterType'] == 'PRICE_FILTER':
+                        tick_size = float(f['tickSize'])
+                        decimals = abs(decimal.Decimal(str(tick_size)).as_tuple().exponent)
+                        return decimals
+        return 2  # fallback
+
+    async def _precompute_qty(self, async_client):
         market_price = await self._get_market_price(async_client)
-        qty = (margin_usd * self.LEVERAGE) / market_price
-        precomputed_qty = int(qty * 0.95)
+        qty = (self.MARGIN_USDT * self.LEVERAGE) / market_price
+        precomputed_qty = int(qty)   # round down to nearest integer
         if precomputed_qty < 1:
             precomputed_qty = 1
-        logging.info(f"Precomputed qty (95% of $5.5 margin at 75x, 2s before entry): {precomputed_qty} contracts at price {market_price}")
-        self.precomputed_qty = precomputed_qty
+        logging.info(f"Precomputed qty for {self.SYMBOL} at price {market_price}: {precomputed_qty}")
+        return precomputed_qty, market_price
 
-    async def _execute_order(self, async_client, side, reduce_only=False):
+    async def _open_long(self, async_client, qty):
         try:
-            qty = self.precomputed_qty
             order = await async_client.futures_create_order(
                 symbol=self.SYMBOL,
-                side=side,
+                side='BUY',
                 type='MARKET',
                 quantity=qty,
-                reduceOnly=reduce_only,
                 newOrderRespType='FULL'
             )
-            logging.info(f"Market {side} order executed for {qty} {self.SYMBOL}: {order}")
+            logging.info(f"Market BUY order executed for {qty} {self.SYMBOL}: {order}")
+            fill_price = float(order['avgFillPrice']) if 'avgFillPrice' in order else float(order['fills'][0]['price'])
+            return order['orderId'], fill_price
+        except Exception as e:
+            logging.error(f"Failed to execute market BUY order: {e}")
+            raise
+
+    async def _place_sell_limit(self, async_client, qty, price, price_decimals):
+        price = round(price, price_decimals)
+        try:
+            order = await async_client.futures_create_order(
+                symbol=self.SYMBOL,
+                side='SELL',
+                type='LIMIT',
+                price=str(price),
+                quantity=qty,
+                timeInForce='GTC',
+                reduceOnly=True,
+                newOrderRespType='FULL'
+            )
+            logging.info(f"Limit SELL order placed at {price} for {qty} {self.SYMBOL}: {order}")
+            return order['orderId'], price
+        except Exception as e:
+            logging.error(f"Failed to place limit SELL order: {e}")
+            raise
+
+    async def _wait_for_order_fill(self, async_client, order_id, timeout):
+        start = time.time()
+        while time.time() - start < timeout:
+            order = await async_client.futures_get_order(
+                symbol=self.SYMBOL,
+                orderId=order_id
+            )
+            if order['status'] == 'FILLED':
+                logging.info(f"Order {order_id} filled.")
+                return True
+            await asyncio.sleep(0.5)
+        logging.info(f"Order {order_id} not filled in {timeout} seconds.")
+        return False
+
+    async def _close_long_market(self, async_client, qty):
+        try:
+            order = await async_client.futures_create_order(
+                symbol=self.SYMBOL,
+                side='SELL',
+                type='MARKET',
+                quantity=qty,
+                reduceOnly=True,
+                newOrderRespType='FULL'
+            )
+            logging.info(f"Market SELL close executed for {qty} {self.SYMBOL}: {order}")
             return order
         except Exception as e:
-            logging.error(f"Failed to execute market {side} order: {e}")
+            logging.error(f"Failed to close position at market price: {e}")
             raise
 
-    async def _transfer_80pct_total_usdt_futures(self, api_key, api_secret, async_client):
-        try:
-            # Get total available USDT in Futures
-            futures_balance = await async_client.futures_account_balance()
-            usdt_balance = 0
-            for asset in futures_balance:
-                if asset['asset'] == 'USDT':
-                    usdt_balance = float(asset['balance'])
-                    break
-            transfer_amount = round(usdt_balance * 0.80, 2)
-            if transfer_amount > 0:
-                transfer_result = await async_futures_transfer(
-                    api_key, api_secret, 'USDT', transfer_amount, 2
-                )
-                logging.info(f"Transferred {transfer_amount} USDT (80% of total futures USDT) from Futures to Spot: {transfer_result}")
-            else:
-                logging.info("Transfer amount is zero, skipping transfer.")
-        except Exception as e:
-            logging.error(f"Failed to transfer 80% of total futures USDT to spot: {e}")
-
-    async def _monitor_funding_fee_and_sell(self, async_client, api_key, api_secret):
-        """Monitor funding fee, then sell and transfer 80% of total futures USDT in parallel."""
-        try:
-            while True:
-                income_history = await async_client.futures_income_history(
-                    symbol=self.SYMBOL,
-                    incomeType='FUNDING_FEE',
-                    limit=10
-                )
-                for income in income_history:
-                    funding_time = income['time']
-                    if funding_time > self.entry_time:
-                        logging.info("\n=== FUNDING FEE DETECTED ===")
-                        logging.info(f"Funding fee credited: {income}")
-                        # Start transfer and exit concurrently (no latency between them)
-                        transfer_task = asyncio.create_task(
-                            self._transfer_80pct_total_usdt_futures(api_key, api_secret, async_client)
-                        )
-                        sell_task = asyncio.create_task(
-                            self._execute_order(
-                                async_client, 'SELL',
-                                reduce_only=True
-                            )
-                        )
-                        done, pending = await asyncio.wait(
-                            [transfer_task, sell_task],
-                            return_when=asyncio.ALL_COMPLETED
-                        )
-                        logging.info(f"ReduceOnly Sell order executed to close long, and 80% of total available futures USDT transferred.")
-                        return
-                await asyncio.sleep(0.01)
-        except Exception as e:
-            logging.error(f"Error while monitoring funding fee: {e}")
-            raise
-
-    async def execute_strategy(self):
+    async def execute_once(self):
         api_key = os.getenv('BINANCE_API_KEY')
         api_secret = os.getenv('BINANCE_API_SECRET')
         async_client = await AsyncClient.create(api_key, api_secret)
         try:
             await self._verify_connection(async_client)
             await self._set_leverage_and_margin_type(async_client)
-            await self._calibrate_time_sync(async_client)
-            entry_target = self._calculate_target(*self.ENTRY_TIME)
-            # --- New: Precompute qty 2 seconds before entry ---
-            precompute_time = entry_target - 2000
-            await self._precision_wait(precompute_time)
-            await self._precompute_qty(async_client, margin_usd=5.5)
-            # --- Wait for actual entry time ---
-            await self._precision_wait(entry_target)
-            logging.info("\n=== ENTRY TRIGGERED ===")
-            buy_order = await self._execute_order(async_client, 'BUY')
-            self.entry_time = self._get_server_time()
-            await self._monitor_funding_fee_and_sell(async_client, api_key, api_secret)
+            logging.info(f"Waiting {self.TRADE_DELAY_SEC} seconds before trading...")
+            await asyncio.sleep(self.TRADE_DELAY_SEC)
+
+            qty, entry_price = await self._precompute_qty(async_client)
+            price_decimals = 3  # Default, you can fetch dynamically with _get_price_decimals if needed
+
+            buy_order_id, real_entry_price = await self._open_long(async_client, qty)
+
+            # Calculate sell price (entry + 0.26%)
+            sell_price = real_entry_price * (1 + self.PROFIT_PCT)
+            sell_price = round(sell_price, price_decimals)
+
+            sell_order_id, limit_price = await self._place_sell_limit(async_client, qty, sell_price, price_decimals)
+
+            filled = await self._wait_for_order_fill(async_client, sell_order_id, self.SELL_TIMEOUT)
+            if not filled:
+                # Cancel limit order
+                try:
+                    await async_client.futures_cancel_order(symbol=self.SYMBOL, orderId=sell_order_id)
+                    logging.info(f"Limit SELL order {sell_order_id} canceled.")
+                except Exception as e:
+                    logging.warning(f"Could not cancel limit order: {e}")
+                # Close at market
+                await self._close_long_market(async_client, qty)
         except Exception as e:
-            logging.error(f"Strategy failed: {e}")
+            logging.error(f"Trade execution failed: {e}")
         finally:
             await async_client.close_connection()
 
 if __name__ == "__main__":
-    trader = PrecisionFuturesTrader()
-    asyncio.run(trader.execute_strategy())
+    trader = KNCUSDTTrader()
+    asyncio.run(trader.execute_once())
