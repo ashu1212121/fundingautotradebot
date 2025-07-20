@@ -59,11 +59,21 @@ class DIAUSDTTrader:
         if entry_dt_ist < ist_now:
             entry_dt_ist += timedelta(days=1)
         entry_dt_utc = entry_dt_ist.astimezone(timezone.utc)
+
+        # --- Latency compensation ---
+        start = datetime.now(timezone.utc)
         server_time_obj = await async_client.futures_time()
+        end = datetime.now(timezone.utc)
+        rtt = (end - start).total_seconds()
+        one_way_latency = rtt / 2
         # Use timezone-aware UTC datetime
         binance_now_utc = datetime.fromtimestamp(server_time_obj['serverTime']/1000.0, timezone.utc)
-        wait_sec = (entry_dt_utc - binance_now_utc).total_seconds()
-        logging.info(f"Waiting {wait_sec:.3f} seconds until {self.ENTRY_IST} IST (Binance UTC: {entry_dt_utc.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]})")
+        wait_sec = (entry_dt_utc - binance_now_utc).total_seconds() - one_way_latency
+        logging.info(
+            f"Waiting {wait_sec:.3f} seconds until {self.ENTRY_IST} IST "
+            f"(Binance UTC: {entry_dt_utc.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}), "
+            f"latency compensation: {one_way_latency:.3f}s"
+        )
         if wait_sec > 0:
             await asyncio.sleep(wait_sec)
         else:
