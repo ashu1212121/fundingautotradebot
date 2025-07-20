@@ -20,9 +20,9 @@ IST = timezone(timedelta(hours=5, minutes=30))  # Indian Standard Time
 class DIAUSDTTrader:
     def __init__(self):
         self.SYMBOL = 'DIAUSDT'
-        self.LEVERAGE = 35
-        self.FIXED_QTY = 610
-        self.ENTRY_IST = "21:29:59.200" # hh:mm:ss.mmm IST
+        self.LEVERAGE = 40
+        self.FIXED_QTY = 450
+        self.ENTRY_IST = "01:29:59.200" # hh:mm:ss.mmm IST
         self.MARGIN_TYPE = 'CROSSED'
         self.FUNDING_POLL_INTERVAL = 0.05  # 50 ms for ultra-fast polling
         self.FUNDING_POLL_TIMEOUT = 10     # 10 seconds safety timeout
@@ -66,7 +66,6 @@ class DIAUSDTTrader:
         end = datetime.now(timezone.utc)
         rtt = (end - start).total_seconds()
         one_way_latency = rtt / 2
-        # Use timezone-aware UTC datetime
         binance_now_utc = datetime.fromtimestamp(server_time_obj['serverTime']/1000.0, timezone.utc)
         wait_sec = (entry_dt_utc - binance_now_utc).total_seconds() - one_way_latency
         logging.info(
