@@ -60,7 +60,8 @@ class DIAUSDTTrader:
             entry_dt_ist += timedelta(days=1)
         entry_dt_utc = entry_dt_ist.astimezone(timezone.utc)
         server_time_obj = await async_client.futures_time()
-        binance_now_utc = datetime.utcfromtimestamp(server_time_obj['serverTime']/1000.0)
+        # Use timezone-aware UTC datetime
+        binance_now_utc = datetime.fromtimestamp(server_time_obj['serverTime']/1000.0, timezone.utc)
         wait_sec = (entry_dt_utc - binance_now_utc).total_seconds()
         logging.info(f"Waiting {wait_sec:.3f} seconds until {self.ENTRY_IST} IST (Binance UTC: {entry_dt_utc.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]})")
         if wait_sec > 0:
